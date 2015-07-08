@@ -1868,8 +1868,9 @@ static llvm::Value *LookupSavedState(CodeGenFunction &CGF) {
   return CGF.CurFn->getValueSymbolTable().lookup(saved_state_name);
 }
 
-static llvm::Value *LookupSavedStatePtr(CodeGenFunction &CGF) {
-  return CGF.CurFn->getValueSymbolTable().lookup(saved_state_ptr_name);
+static llvm::AllocaInst *LookupSavedStatePtr(CodeGenFunction &CGF) {
+  return cast_or_null<llvm::AllocaInst>(
+      CGF.CurFn->getValueSymbolTable().lookup(saved_state_ptr_name));
 }
 
 static llvm::Value *LookupParentSynced(CodeGenFunction &CGF) {
@@ -2241,16 +2242,17 @@ ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
     // TODO: must be part of pending frame if pending
     llvm::AllocaInst *SavedStateIfReady
 	= new llvm::AllocaInst(SavedStateTy, saved_state_name, &*AllocaStart);
-    llvm::AllocaInst *SavedState
-	= new llvm::AllocaInst(
-	    llvm::PointerType::getUnqual(SavedStateTy),
-	    saved_state_ptr_name, &*AllocaStart);
+    llvm::AllocaInst *SavedState = LookupSavedStatePtr(*this);
 
     // Initialize SavedState to point to the local alloca struct which will
     // be used only in case all arguments are ready.
-    new StoreInst(SavedStateIfReady, SavedState, &*AllocaStart);
+    llvm::Type * Int8Ty = llvm::Type::getInt8Ty(getLLVMContext());
+    Value *SSVoid = new BitCastInst(SavedStateIfReady,
+				    llvm::PointerType::getUnqual(Int8Ty),
+				    "", &*AllocaStart);
+    new StoreInst(SSVoid, SavedState, &*AllocaStart);
 
-    Info->setSavedState( SavedStateTy, SavedState, SavedStateArgStart );
+    Info->setSavedState(SavedStateTy, SavedState, SavedStateArgStart );
 
     // Replace each of the alloc's with a GEP from the saved state
     llvm::Value * idx[2];
@@ -2386,10 +2388,14 @@ RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
 
     // GEP the args portion twice to facilitate cloning of the reload block
     // into the call function
-    llvm::Value *SavedState1 = B1.CreateLoad(SavedState);
+    llvm::PointerType *SSPTy
+	= llvm::PointerType::getUnqual(Info->getSavedStateTy());
+    llvm::Value *SavedState1Void = B1.CreateLoad(SavedState);
+    llvm::Value *SavedState1 = B1.CreateBitCast(SavedState1Void, SSPTy);
     llvm::Value * ArgsSave =
 	B1.CreateConstInBoundsGEP2_32(SavedState1, 0, 0);
-    llvm::Value *SavedState2 = B2.CreateLoad(SavedState);
+    llvm::Value *SavedState2Void = B2.CreateLoad(SavedState);
+    llvm::Value *SavedState2 = B2.CreateBitCast(SavedState2Void, SSPTy);
     llvm::Value * ArgsReload =
 	B2.CreateConstInBoundsGEP2_32(SavedState2, 0, 0);
 
@@ -2654,8 +2660,10 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
 
   if( Info ) {
     // Need to avoid inclusion of this in the saved state
-    llvm::AllocaInst *SavedStateIfReady
-	= CGF.CreateTempAlloca(Int8PtrTy, "__cilkrts_saved_state");
+    // llvm::AllocaInst *SavedStateIfReady = CGF.CreateTempAlloca(Int8PtrTy, "");
+    // SavedStateIfReady->setName(saved_state_name);
+    llvm::AllocaInst *SavedStatePtr = CGF.CreateTempAlloca(Int8PtrTy, "");
+    SavedStatePtr->setName(saved_state_ptr_name);
     llvm::AllocaInst *ParentSynced = CGF.CreateTempAlloca(Int1Ty, "");
     ParentSynced->setName(parent_synced_name);
 
@@ -2689,7 +2697,7 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
 	llvm::Type *PFTy = TypeBuilder<__cilkrts_pending_frame *,false>::get(Ctx);
 	Value *PF = B.CreateBitCast(LookupPendingFrameArg(CGF), PFTy);
 	Value *AT = LoadField(B, PF, PendingFrameBuilder::args_tags);
-	B.CreateStore(AT, LookupSavedStatePtr(CGF));
+	B.CreateStore(AT, SavedStatePtr);
 	// TODO: also initialize stack frame on this code path (enter_frame, detach)
 	B.CreateBr(ReloadBB);
     }
@@ -2732,7 +2740,7 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
 
 	CGF.EmitBlock(ElectBB);
 	Value *ArgsTags = LoadField(B, PF, PendingFrameBuilder::args_tags);
-	B.CreateStore(ArgsTags, SavedStateIfReady);
+	B.CreateStore(ArgsTags, SavedStatePtr);
 	B.CreateBr(SaveStateBB);
     }
 
