@@ -2507,8 +2507,12 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
 
   // If this call is a Cilk spawn call, then we need to emit the prologue
   // before emitting the real call.
-  if (IsCilkSpawnCall)
-    CGM.getCilkPlusRuntime().EmitCilkHelperPrologue(*this);
+  if (IsCilkSpawnCall) {
+      if (isa<CGCilkDataflowSpawnInfo>(CapturedStmtInfo))
+	  CGM.getCilkPlusRuntime().EmitCilkHelperDataFlowPrologue(*this,CallInfo,Args);
+      else
+	  CGM.getCilkPlusRuntime().EmitCilkHelperPrologue(*this);
+  }
 
   llvm::BasicBlock *InvokeDest = 0;
   if (!Attrs.hasAttribute(llvm::AttributeSet::FunctionIndex,

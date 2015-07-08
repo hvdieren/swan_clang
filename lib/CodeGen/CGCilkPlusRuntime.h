@@ -51,9 +51,15 @@ public:
 
   void EmitCilkHelperStackFrame(CodeGenFunction &CGF);
 
+    void EmitCilkDataflowHelperStackFrame(CodeGenFunction &CGF, Stmt * S);
+
   void EmitCilkHelperPrologue(CodeGenFunction &CGF);
 
   void pushCilkImplicitSyncCleanup(CodeGenFunction &CGF);
+
+  void EmitCilkHelperDataFlowPrologue(CodeGenFunction &CGF,
+				      const CGFunctionInfo &CallInfo,
+				      SmallVector<llvm::Value *, 16> & Args);
 };
 
 /// \brief API to query if an implicit sync is necessary during code generation.

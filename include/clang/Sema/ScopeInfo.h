@@ -572,6 +572,8 @@ public:
       return "default captured statement";
     case CR_CilkSpawn:
       return "_Cilk_spawn";
+    case CR_CilkDataflowSpawn:
+      return "_Cilk_dataflow_spawn";
     case CR_CilkFor:
       return "_Cilk_for";
     case CR_SIMDFor:

@@ -959,7 +959,8 @@ RValue CodeGenFunction::EmitBlockCallExpr(const CallExpr *E,
 
   // And the rest of the arguments.
   EmitCallArgs(Args, FnType->getAs<FunctionProtoType>(),
-               E->arg_begin(), E->arg_end());
+               E->arg_begin(), E->arg_end(),
+	       FuncPtr->getType(), E->isCilkSpawnCall());
 
   // Load the function.
   llvm::Value *Func = Builder.CreateLoad(FuncPtr);

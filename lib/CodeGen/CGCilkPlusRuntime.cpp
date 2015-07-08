@@ -12,6 +12,8 @@
 /// making calls to the cilkrts library and call to the spawn helper function.
 ///
 //===----------------------------------------------------------------------===//
+#include <iterator>
+
 #include "CGCilkPlusRuntime.h"
 #include "CGCleanup.h"
 #include "CodeGenFunction.h"
@@ -27,6 +29,7 @@
 #include "llvm/IR/ValueSymbolTable.h"
 #include "llvm/Support/CallSite.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 namespace {
 
@@ -34,7 +37,23 @@ typedef void *__CILK_JUMP_BUFFER[5];
 
 struct __cilkrts_pedigree {};
 struct __cilkrts_stack_frame {};
+struct __cilkrts_pending_frame {};
 struct __cilkrts_worker {};
+struct __cilkrts_task_list_node {};
+struct __cilkrts_task_list {};
+struct spin_mutex {};
+struct __cilkrts_obj_metadata {};
+struct __cilkrts_ready_list {};
+struct __cilkrts_versioned {};
+struct __cilkrts_obj_version {};
+
+enum {
+    CILK_OBJ_GROUP_EMPTY = 1,
+    CILK_OBJ_GROUP_READ = 2,
+    CILK_OBJ_GROUP_WRITE = 4,
+    CILK_OBJ_GROUP_COMMUT = 8,
+    CILK_OBJ_GROUP_NOT_WRITE = 15 - (int)CILK_OBJ_GROUP_WRITE
+};
 
 enum {
   __CILKRTS_ABI_VERSION = 1
@@ -48,6 +67,8 @@ enum {
   CILK_FRAME_EXCEPTING        =    0x10,
   CILK_FRAME_LAST             =    0x80,
   CILK_FRAME_EXITING          =  0x0100,
+  CILK_FRAME_DATAFLOW         =  0x0200,
+  CILK_FRAME_DATAFLOW_ISSUED  =  0x0400,
   CILK_FRAME_SUSPENDED        =  0x8000,
   CILK_FRAME_UNWINDING        = 0x10000
 };
@@ -92,6 +113,22 @@ typedef void (__cilkrts_cilk_for_64)(__cilk_abi_f64_t body, void *data,
 
 typedef void (cilk_func)(__cilkrts_stack_frame *);
 
+typedef uint32_t (__cilkrts_obj_metadata_ini_ready)(__cilkrts_obj_metadata * meta,
+						    uint32_t g);
+typedef __cilkrts_pending_frame *(__cilkrts_pending_frame_create)(uint32_t);
+typedef void (__cilkrts_pending_call_fn)(__cilkrts_pending_frame *);
+typedef void (__cilkrts_obj_metadata_add_task_read)(__cilkrts_pending_frame *,
+						    __cilkrts_obj_metadata *,
+						    __cilkrts_task_list_node *);
+typedef void (__cilkrts_obj_metadata_add_task_write)(__cilkrts_pending_frame *,
+						     __cilkrts_obj_metadata *,
+						     __cilkrts_task_list_node *);
+typedef void (__cilkrts_obj_metadata_add_pending_to_ready_list)(
+    __cilkrts_worker *, __cilkrts_pending_frame *);
+typedef void (__cilkrts_detach_pending)(__cilkrts_pending_frame *sf);
+typedef void (__cilkrts_issue_fn_ty)(__cilkrts_pending_frame *, void *);
+typedef void (__cilkrts_df_helper_fn_ty)(__cilkrts_stack_frame *, char *,
+					 __cilkrts_issue_fn_ty *, int);
 } // namespace
 
 #define CILKRTS_FUNC(name, CGF) Get__cilkrts_##name(CGF)
@@ -108,6 +145,10 @@ DEFAULT_GET_CILKRTS_FUNC(rethrow)
 DEFAULT_GET_CILKRTS_FUNC(leave_frame)
 DEFAULT_GET_CILKRTS_FUNC(get_tls_worker)
 DEFAULT_GET_CILKRTS_FUNC(bind_thread_1)
+DEFAULT_GET_CILKRTS_FUNC(pending_frame_create)
+DEFAULT_GET_CILKRTS_FUNC(obj_metadata_add_task_read)
+DEFAULT_GET_CILKRTS_FUNC(obj_metadata_add_task_write)
+DEFAULT_GET_CILKRTS_FUNC(detach_pending)
 
 typedef std::map<llvm::LLVMContext*, llvm::StructType*> TypeBuilderCache;
 
@@ -115,8 +156,15 @@ namespace llvm {
 
 /// Specializations of llvm::TypeBuilder for:
 ///   __cilkrts_pedigree,
+///   __cilkrts_ready_list,
 ///   __cilkrts_worker,
-///   __cilkrts_stack_frame
+///   __cilkrts_stack_frame,
+///   spin_mutex,
+///   __cilkrts_task_list_node,
+///   __cilkrts_task_list,
+///   __cilkrts_obj_metadata
+///   __cilkrts_obj_version
+///   __cilkrts_versioned
 template <bool X>
 class TypeBuilder<__cilkrts_pedigree, X> {
 public:
@@ -136,6 +184,28 @@ public:
   enum {
     rank,
     next
+  };
+};
+
+template <bool X>
+class TypeBuilder<__cilkrts_ready_list, X> {
+public:
+  static StructType *get(LLVMContext &C) {
+    static TypeBuilderCache cache;
+    TypeBuilderCache::iterator I = cache.find(&C);
+    if (I != cache.end())
+      return I->second;
+    StructType *Ty = StructType::create(C, "__cilkrts_ready_list");
+    cache[&C] = Ty;
+    Ty->setBody(
+      TypeBuilder<__cilkrts_pending_frame *, X>::get(C), // dummy
+      TypeBuilder<__cilkrts_pending_frame *, X>::get(C), // tail
+      NULL);
+    return Ty;
+  }
+  enum {
+    dummy,
+    tail
   };
 };
 
@@ -163,6 +233,7 @@ public:
       TypeBuilder<__cilkrts_stack_frame**, X>::get(C), // saved_protected_tail
       TypeBuilder<void*,                   X>::get(C), // sysdep
       TypeBuilder<__cilkrts_pedigree,      X>::get(C), // pedigree
+      TypeBuilder<__cilkrts_ready_list,    X>::get(C), // ready_list
       NULL);
     return Ty;
   }
@@ -179,7 +250,8 @@ public:
     current_stack_frame,
     saved_protected_tail,
     sysdep,
-    pedigree
+    pedigree,
+    ready_list
   };
 };
 
@@ -204,6 +276,9 @@ public:
       TypeBuilder<uint16_t,               X>::get(C), // fpcsr
       TypeBuilder<uint16_t,               X>::get(C), // reserved
       TypeBuilder<__cilkrts_pedigree,     X>::get(C), // parent_pedigree
+      TypeBuilder<__cilkrts_issue_fn_ty *,X>::get(C), // df_issue_fn
+      TypeBuilder<void *,                 X>::get(C), // args_tags
+      TypeBuilder<__cilkrts_stack_frame *,X>::get(C), // df_issue_child
       NULL);
     return Ty;
   }
@@ -217,9 +292,179 @@ public:
     mxcsr,
     fpcsr,
     reserved,
-    parent_pedigree
+    parent_pedigree,
+    df_issue_fn,
+    args_tags,
+    df_issue_child
   };
 };
+
+template <bool X>
+class TypeBuilder<__cilkrts_pending_frame, X> {
+public:
+  static StructType *get(LLVMContext &C) {
+    static TypeBuilderCache cache;
+    TypeBuilderCache::iterator I = cache.find(&C);
+    if (I != cache.end())
+      return I->second;
+    StructType *Ty = StructType::create(C, "__cilkrts_pending_frame");
+    cache[&C] = Ty;
+    Ty->setBody(
+      TypeBuilder<__cilkrts_pending_frame *,   X>::get(C), // next_ready_frame
+      TypeBuilder<__cilkrts_pedigree,          X>::get(C), // pedigree
+      TypeBuilder<void *,                      X>::get(C), // frame_ff
+      TypeBuilder<__cilkrts_pending_call_fn *, X>::get(C), // call_fn
+      TypeBuilder<void *,                      X>::get(C), // args_tags
+      TypeBuilder<int,                         X>::get(C), // incoming_count
+      NULL);
+    return Ty;
+  }
+  enum {
+    next_ready_frame,
+    pedigree,
+    frame_ff,
+    call_fn,
+    args_tags,
+    incoming_count
+  };
+};
+
+template <bool X>
+class TypeBuilder<__cilkrts_task_list_node, X> {
+public:
+  static StructType *get(LLVMContext &C) {
+    static TypeBuilderCache cache;
+    TypeBuilderCache::iterator I = cache.find(&C);
+    if (I != cache.end())
+      return I->second;
+    StructType *Ty = StructType::create(C, "__cilkrts_task_list_node");
+    cache[&C] = Ty;
+    Ty->setBody(
+      TypeBuilder<__cilkrts_task_list_node *, X>::get(C), // it_next
+      TypeBuilder<__cilkrts_pending_frame *,  X>::get(C), // st_task
+      NULL);
+    return Ty;
+  }
+  enum {
+    it_next,
+    st_task
+  };
+};
+
+template <bool X>
+class TypeBuilder<__cilkrts_task_list, X> {
+public:
+  static StructType *get(LLVMContext &C) {
+    static TypeBuilderCache cache;
+    TypeBuilderCache::iterator I = cache.find(&C);
+    if (I != cache.end())
+      return I->second;
+    StructType *Ty = StructType::create(C, "__cilkrts_task_list");
+    cache[&C] = Ty;
+    Ty->setBody(
+      TypeBuilder<__cilkrts_task_list_node,   X>::get(C), // head
+      TypeBuilder<__cilkrts_task_list_node *, X>::get(C), // tail
+      NULL);
+    return Ty;
+  }
+  enum {
+    head,
+    tail
+  };
+};
+
+template <bool X>
+class TypeBuilder<spin_mutex, X> {
+public:
+  static StructType *get(LLVMContext &C) {
+    static TypeBuilderCache cache;
+    TypeBuilderCache::iterator I = cache.find(&C);
+    if (I != cache.end())
+      return I->second;
+    StructType *Ty = StructType::create(C, "spin_mutex");
+    cache[&C] = Ty;
+    Ty->setBody(
+      TypeBuilder<int,                   X>::get(C), // field
+      TypeBuilder<int[64/sizeof(int)-1], X>::get(C), // opaque
+      NULL);
+    return Ty;
+  }
+  enum {
+    field,
+    opaque
+  };
+};
+
+
+template <bool X>
+class TypeBuilder<__cilkrts_obj_metadata, X> {
+public:
+  static StructType *get(LLVMContext &C) {
+    static TypeBuilderCache cache;
+    TypeBuilderCache::iterator I = cache.find(&C);
+    if (I != cache.end())
+      return I->second;
+    StructType *Ty = StructType::create(C, "__cilkrts_obj_metadata");
+    cache[&C] = Ty;
+    Ty->setBody(
+      TypeBuilder<uint64_t,             X>::get(C), // oldest_num_tasks
+      TypeBuilder<uint32_t,             X>::get(C), // youngest_group (enum)
+      TypeBuilder<uint32_t,             X>::get(C), // num_gens
+      TypeBuilder<__cilkrts_task_list,  X>::get(C), // tasks
+      TypeBuilder<spin_mutex,           X>::get(C), // mutex
+      NULL);
+    return Ty;
+  }
+  enum {
+    oldest_num_tasks,
+    youngest_group,
+    num_gens,
+    tasks,
+    mutex
+  };
+};
+
+template <bool X>
+class TypeBuilder<__cilkrts_obj_version, X> {
+public:
+  static StructType *get(LLVMContext &C) {
+    static TypeBuilderCache cache;
+    TypeBuilderCache::iterator I = cache.find(&C);
+    if (I != cache.end())
+      return I->second;
+    StructType *Ty = StructType::create(C, "__cilkrts_obj_metadata");
+    cache[&C] = Ty;
+    Ty->setBody(
+	TypeBuilder<__cilkrts_obj_metadata, X>::get(C), // meta
+      NULL);
+    return Ty;
+  }
+  enum {
+    meta
+  };
+};
+
+template <bool X>
+class TypeBuilder<__cilkrts_versioned, X> {
+public:
+  static StructType *get(LLVMContext &C) {
+    static TypeBuilderCache cache;
+    TypeBuilderCache::iterator I = cache.find(&C);
+    if (I != cache.end())
+      return I->second;
+    StructType *Ty = StructType::create(C, "__cilkrts_versioned");
+    cache[&C] = Ty;
+    Ty->setBody(
+	TypeBuilder<__cilkrts_obj_version*, X>::get(C), // version
+      NULL);
+    return Ty;
+  }
+  enum {
+    version
+  };
+};
+
+
 
 } // namespace llvm
 
@@ -231,6 +476,12 @@ using namespace llvm;
 typedef llvm::TypeBuilder<__cilkrts_stack_frame, false> StackFrameBuilder;
 typedef llvm::TypeBuilder<__cilkrts_worker, false> WorkerBuilder;
 typedef llvm::TypeBuilder<__cilkrts_pedigree, false> PedigreeBuilder;
+typedef llvm::TypeBuilder<__cilkrts_obj_metadata, false> ObjMetadataBuilder;
+typedef llvm::TypeBuilder<__cilkrts_obj_version, false> ObjVersionBuilder;
+typedef llvm::TypeBuilder<__cilkrts_versioned, false> VersionedBuilder;
+typedef llvm::TypeBuilder<__cilkrts_pending_frame, false> PendingFrameBuilder;
+typedef llvm::TypeBuilder<__cilkrts_ready_list, false> ReadyListBuilder;
+typedef llvm::TypeBuilder<__cilkrts_task_list_node, false> TaskListNodeBuilder;
 
 static Value *GEP(CGBuilderTy &B, Value *Base, int field) {
   return B.CreateConstInBoundsGEP2_32(Base, 0, field);
@@ -1009,6 +1260,90 @@ static llvm::Function *GetCilkHelperPrologue(CodeGenFunction &CGF) {
   return Fn;
 }
 
+/// \brief Get or create a LLVM function for __cilk_df_helper_prologue.
+/// It is equivalent to the following C code
+///
+/// void __cilk_df_helper_prologue(__cilkrts_stack_frame *sf, char *at,
+///                                __cilkrts_issue_fn_ty issue_fn,
+///                                bool PARENT_SYNCED) {
+///   __cilkrts_enter_frame_fast_1(sf);
+///   sf->df_issue_fn = issue_fn;
+///   sf->args_tags = (char *)at;
+///   if( !PARENT_SYNCED ) {
+///	  sf->flags |= CILK_FRAME_DATAFLOW_ISSUED;
+///	  (*issue_fn)( 0, at ); // pending_frame *, void *
+///   } else
+///	  sf->call_parent->df_issue_child = sf;
+///   __cilkrts_detach(sf);
+/// }
+static llvm::Function *GetCilkDataflowHelperPrologue(CodeGenFunction &CGF) {
+  Function *Fn = 0;
+
+  if (GetOrCreateFunction<__cilkrts_df_helper_fn_ty>(
+	  "__cilk_df_helper_prologue", CGF, Fn))
+    return Fn;
+
+  // If we get here we need to add the function body
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  llvm::Function::arg_iterator Arg = Fn->arg_begin();
+  Value *SF = Arg;
+  Value *AT = ++Arg;
+  Value *IF = ++Arg;
+  Value *PARENT_SYNCED = ++Arg;
+
+  BasicBlock *Entry = CGF.createBasicBlock("entry", Fn);
+  BasicBlock *Sync = CGF.createBasicBlock("sync", Fn);
+  BasicBlock *Unsync = CGF.createBasicBlock("unsync", Fn);
+  BasicBlock *Exit = CGF.createBasicBlock("exit", Fn);
+  CGBuilderTy B(Entry);
+
+  // __cilkrts_enter_frame_fast_1(sf); -- TODO: enter_frame_fast_df
+  B.CreateCall(CILKRTS_FUNC(enter_frame_fast_1, CGF), SF);
+
+  // sf->df_issue_fn = issue_fn;
+  // sf->args_tags = (char *)at;
+  StoreField(B, IF, SF, StackFrameBuilder::df_issue_fn);
+  StoreField(B, AT, SF, StackFrameBuilder::args_tags);
+
+  // if( !PARENT_SYNCED ) {
+  Value *Cond = B.CreateICmpNE(PARENT_SYNCED,
+			       ConstantInt::get(PARENT_SYNCED->getType(), 0));
+  B.CreateCondBr(Cond, Sync, Unsync);
+
+  B.SetInsertPoint(Sync);
+  //	sf->flags |= CILK_FRAME_DATAFLOW_ISSUED;
+  Value *Flags = LoadField(B, SF, StackFrameBuilder::flags);
+  Value *SFlag
+      = B.CreateOr(Flags,
+		   ConstantInt::get(Flags->getType(),
+				    CILK_FRAME_DATAFLOW_ISSUED));
+  StoreField(B, SFlag, SF, StackFrameBuilder::flags);
+
+  //	(*issue_fn)( 0, at ); // pending_frame *, void *
+  Value *SFNull = ConstantPointerNull::get(
+      TypeBuilder<__cilkrts_pending_frame*, false>::get(Ctx));
+      // llvm::PointerType::getUnqual(
+	  // TypeBuilder<__cilkrts_pending_frame, false>::get(Ctx)));
+  B.CreateCall2(IF, SFNull, AT);
+  B.CreateBr(Exit);
+
+  B.SetInsertPoint(Unsync);
+  //	sf->call_parent->df_issue_child = sf;
+  Value *CP = LoadField(B, SF, StackFrameBuilder::call_parent);
+  StoreField(B, SF, CP, StackFrameBuilder::df_issue_child);
+  B.CreateBr(Exit);
+
+  // __cilkrts_detach(sf);
+  B.SetInsertPoint(Exit);
+  B.CreateCall(CILKRTS_FUNC(detach, CGF), SF);
+  B.CreateRetVoid();
+
+  Fn->addFnAttr(Attribute::InlineHint);
+
+  return Fn;
+}
+
 /// \brief Get or create a LLVM function for __cilk_helper_epilogue.
 /// It is equivalent to the following C code
 ///
@@ -1066,10 +1401,479 @@ static llvm::Function *GetCilkHelperEpilogue(CodeGenFunction &CGF) {
   return Fn;
 }
 
+/// \brief Get or create a LLVM function for __cilkrts_obj_metadata_ini_ready.
+/// It is equivalent to the following C code
+///
+/// void __cilkrts_obj_metadata_ini_ready(struct __cilkrts_obj_metadata *meta,
+///                                       uint32_t grp ) {
+///   if( m->num_gens == 1 ) {
+///       if( ( m->youngest.g & ((grp | g_empty) & not_g_write) ) != 0 )
+///           return true;
+///   }
+///   return m->num_gens == 0;
+/// }
+static Function *Get__cilkrts_obj_metadata_ini_ready(CodeGenFunction &CGF) {
+  Function *Fn = 0;
+
+  if (GetOrCreateFunction<__cilkrts_obj_metadata_ini_ready>(
+	  "__cilkrts_obj_metadata_ini_ready", CGF, Fn))
+    return Fn;
+
+  // If we get here we need to add the function body
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  Value * meta = Fn->arg_begin();
+  Value * grp = ++Fn->arg_begin();
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+  BasicBlock *Group = BasicBlock::Create(Ctx, "group", Fn);
+  BasicBlock *Empty = BasicBlock::Create(Ctx, "empty", Fn);
+  BasicBlock *Ready = BasicBlock::Create(Ctx, "ready", Fn);
+
+  // if( m->num_gens == 1 ) {
+  Value *num_gens;
+  {
+      CGBuilderTy B(Entry);
+      num_gens = LoadField(B, meta, ObjMetadataBuilder::num_gens);
+      Value *Cond = B.CreateICmpEQ(num_gens,
+				   ConstantInt::get(num_gens->getType(), 1));
+      B.CreateCondBr(Cond, Group, Empty);
+  }
+
+  //     if( ( m->youngest.g & ((grp | g_empty) & not_g_write) ) != 0 )
+  {
+      CGBuilderTy B(Group);
+      llvm::Type * Ty = grp->getType();
+      Value *g = LoadField(B, meta, ObjMetadataBuilder::youngest_group);
+      Value *grp1
+	  = B.CreateOr(grp, ConstantInt::get(Ty, CILK_OBJ_GROUP_EMPTY));
+      Value *gnw
+	  = B.CreateAnd(grp1, ConstantInt::get(Ty, CILK_OBJ_GROUP_NOT_WRITE));
+      Value *expr = B.CreateAnd(g, gnw);
+      Value *Cond = B.CreateICmpNE(expr, ConstantInt::get(Ty, 0));
+      B.CreateCondBr(Cond, Ready, Empty);
+  }
+
+  //         return true;
+  // }
+  {
+      CGBuilderTy B(Ready);
+      B.CreateRet( ConstantInt::get( llvm::Type::getInt32Ty(Ctx), 1 ) );
+  }
+
+  // return m->num_gens == 0;
+  {
+      CGBuilderTy B(Empty);
+      Value *Cond = B.CreateICmpEQ(num_gens,
+				   ConstantInt::get(num_gens->getType(), 0));
+      Value *Cast = B.CreateZExt(Cond, llvm::Type::getInt32Ty(Ctx));
+      B.CreateRet( Cast );
+  }
+
+  Fn->addFnAttr(Attribute::InlineHint);
+
+  return Fn;
+}
+
+/// \brief Get or create a LLVM function for __cilkrts_obj_metadata_ini_ready.
+/// It is equivalent to the following C code
+///
+/// void __cilkrts_obj_metadata_add_pending_to_ready_list(
+///             __cilkrts_worker *w, __cilkrts_pending_frame *pf) {
+///    pf->next_ready_frame = 0;
+///    w->ready_list.tail->next_ready_frame = pf;
+///    w->ready_list.tail = pf;
+/// }
+static Function *
+Get__cilkrts_obj_metadata_add_pending_to_ready_list(CodeGenFunction &CGF) {
+  Function *Fn = 0;
+
+  if (GetOrCreateFunction<__cilkrts_obj_metadata_add_pending_to_ready_list>(
+	  "__cilkrts_obj_metadata_add_pending_to_ready_list", CGF, Fn))
+    return Fn;
+
+  // If we get here we need to add the function body
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  Value *W = Fn->arg_begin();
+  Value *PF = ++Fn->arg_begin();
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+  CGBuilderTy B(Entry);
+  StoreField(B, ConstantPointerNull::get(
+		 cast<llvm::PointerType>(PF->getType())),
+	     PF, PendingFrameBuilder::next_ready_frame);
+  Value *RL = GEP(B, W, WorkerBuilder::ready_list);
+  Value *Tail = LoadField(B, RL, ReadyListBuilder::tail);
+  StoreField(B, Tail, PF, PendingFrameBuilder::next_ready_frame);
+  StoreField(B, PF, RL, ReadyListBuilder::tail);
+  B.CreateRetVoid();
+
+  Fn->addFnAttr(Attribute::InlineHint);
+
+  return Fn;
+}
+
+static bool
+IsDataflowType(const clang::Type * type) {
+    if( type->isRecordType() ) {
+	if( const CXXRecordDecl * rdecl = type->getAsCXXRecordDecl() ) {
+	    // Does any of the methods of the struct/union/class have a
+	    // signature method name?
+	    for( CXXRecordDecl::method_iterator
+		     I=rdecl->method_begin(),
+		     E=rdecl->method_end(); I != E; ++I ) {
+		FunctionDecl * m = *I;
+		if( IdentifierInfo * id = m->getIdentifier() ) {
+		    if( id->isStr( "__Cilk_is_dataflow_type" ) )
+			return true;
+		}
+	    }
+	}
+    }
+    return false;
+}
+
+static llvm::Function *
+CreateCallFn(CodeGenFunction &CGF, llvm::Function * HelperF) {
+    llvm::Module &Module = CGF.CGM.getModule();
+    LLVMContext &Ctx = CGF.getLLVMContext();
+    llvm::Type * Int1Ty = llvm::Type::getInt1Ty(Ctx);
+    llvm::Type * Int32Ty = llvm::Type::getInt32Ty(Ctx);
+
+    // Create CallFn
+    llvm::FunctionType *FTy
+	= TypeBuilder<__cilkrts_pending_call_fn, false>::get(Ctx);
+    llvm::Function *CallFn
+	= llvm::Function::Create(FTy, llvm::GlobalValue::InternalLinkage,
+				 "__cilkrts_df_spawn_helper_call_fn", &Module);
+
+    // Call the multi-function.
+    BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", CallFn);
+    CGBuilderTy B(Entry);
+
+    SmallVector<llvm::Value *, 5> Args;
+    // Common arguments: Capture argument struct, receiver (if present)
+    unsigned NumArgs = std::distance(HelperF->arg_begin(), HelperF->arg_end());
+    unsigned i = 0;
+    NumArgs -= 2; // Final arguments are the pending frame and the flag (Int1Ty)
+    for( llvm::Function::arg_iterator
+	     I=HelperF->arg_begin(), E=HelperF->arg_end();
+	 I != E && i < NumArgs; ++I, ++i ) {
+	if( llvm::PointerType * PTy = dyn_cast<llvm::PointerType>(I->getType()) )
+	    Args.push_back(ConstantPointerNull::get(PTy));
+	else
+	    Args.push_back(ConstantInt::get(I->getType(), 0));
+    }
+    
+    // Penultimate argument: pending_frmae
+    llvm::PointerType *PFVTy =
+	llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx));
+    Args.push_back(B.CreateBitCast(CallFn->arg_begin(), PFVTy));
+    // Final argument: helper_flag
+    Args.push_back(ConstantInt::get(Int1Ty, 1));
+
+    B.CreateCall(HelperF, Args);
+    // TODO: Call release function -- in exception path?
+    B.CreateRetVoid();
+
+    return CallFn;
+}
+
+static llvm::Function *
+CreateIniReadyFn(CodeGenFunction &CGF) {
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  CodeGenFunction::CGCilkDataflowSpawnInfo *Info
+      = cast<CodeGenFunction::CGCilkDataflowSpawnInfo >(CGF.CapturedStmtInfo);
+
+  const char * FnName = "__cilk_df_spawn_helper_ini_ready_fn";
+
+  // Create the function. Type is:
+  // __cilkrts_pending_frame * ( struct anon * )
+  llvm::Type * params[] = {
+      CGF.CapturedStmtInfo->getContextValue()->getType() // ,
+      // llvm::Type::getInt32Ty(Ctx)
+  };
+  llvm::FunctionType *FTy = llvm::FunctionType::get(
+      TypeBuilder<__cilkrts_pending_frame *, false>::get(Ctx), params, false);
+  llvm::Function * Fn
+      = Function::Create(FTy, llvm::GlobalValue::InternalLinkage,
+			 FnName, &CGF.CGM.getModule());
+
+  Info->setIniReadyFn(Fn);
+
+  return Fn;
+}
+
+static void
+CompleteIniReadyFn(CodeGenFunction &CGF,
+		   CallExpr::const_arg_iterator ArgBeg,
+		   CallExpr::const_arg_iterator ArgEnd ) {
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  CodeGenFunction::CGCilkDataflowSpawnInfo *Info
+      = cast<CodeGenFunction::CGCilkDataflowSpawnInfo >(CGF.CapturedStmtInfo);
+
+  llvm::Function *Fn = Info->getIniReadyFn();
+
+  // Function arguments
+  llvm::Type *Int32Ty = llvm::Type::getInt32Ty(Ctx);
+  Function::arg_iterator I = Fn->arg_begin();
+  llvm::Argument *SavedState = I; // Captured state, not args_tags
+
+  // Key basic blocks
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+  BasicBlock *Unsynced = BasicBlock::Create(Ctx, "unsynced", Fn);
+  BasicBlock *bb_ready = 0; // BasicBlock::Create(Ctx, "ready", Fn);
+  BasicBlock *bb_not_ready = BasicBlock::Create(Ctx, "not_ready", Fn);
+
+  // Start off with the ready checks
+  CGBuilderTy B(Unsynced);
+
+  // Now we need to know which arguments are dataflow and emit a call to
+  // __cilkrts_obj_metadata_ini_ready for them.
+  unsigned i=0;
+  for( CallExpr::const_arg_iterator I=ArgBeg, E=ArgEnd; I != E; ++I, ++i ) {
+      const clang::Type * type = I->getType().getTypePtr();
+      if( IsDataflowType( type ) ) {
+	  // Emit a ready check and move the insertion point to the basic block
+	  // on the ready path, creating a new ready block.
+	  // EmitCilkHelperIniReadyArg(CGF, bb_ready, bb_not_ready, Args[i]);
+	  // Value * Meta = CallArgs[i].RV.getScalarVal();
+	  Value *VersionedRef = LoadField(B, SavedState, i);
+	  Value *Version = LoadField(B, VersionedRef, VersionedBuilder::version);
+	  Value *MetaRaw = GEP(B, Version, ObjVersionBuilder::meta);
+	  Value *Meta
+	      = B.CreateBitCast(MetaRaw,
+				CILKRTS_FUNC(obj_metadata_ini_ready, CGF)
+				->arg_begin()->getType());
+	  Value *Group
+	      = ConstantInt::get(llvm::Type::getInt32Ty(Ctx),
+				 CILK_OBJ_GROUP_WRITE); // TODO - READ?
+	  Value *IReady
+	      = B.CreateCall2(CILKRTS_FUNC(obj_metadata_ini_ready, CGF), Meta, Group);
+
+	  Value *Cond = B.CreateICmpNE(IReady,
+				       ConstantInt::get(IReady->getType(), 0));
+	  bb_ready = BasicBlock::Create(Ctx, "ready", Fn, bb_not_ready);
+	  B.CreateCondBr(Cond, bb_ready, bb_not_ready);
+
+	  B.SetInsertPoint(bb_ready);
+      }
+  }
+
+  // Create the case where arguments are initially not ready: pending frame
+  B.SetInsertPoint(bb_not_ready);
+  {
+      // Get size of SavedStateType (args_tags)
+      llvm::StructType *State = Info->getSavedStateTy();
+      // Get structure size
+      Value *INull = ConstantInt::get(Int32Ty, 0);
+      Value *SNull = B.CreatePointerCast(INull, llvm::PointerType::getUnqual(State));
+      Value *A1 = B.CreateGEP(SNull, ConstantInt::get(Int32Ty, 1));
+      Value *Size = B.CreatePointerCast(A1, Int32Ty);
+
+      // Create a pending frame with appropriate room for args_tags.
+      // Initialize args_tags pointer.
+      // __cilkrts_pending_frame * pf
+      //    = __cilkrts_pending_frame_create( sizeof(struct State) );
+      Value *PF
+	  = B.CreateCall(CILKRTS_FUNC(pending_frame_create, CGF), Size);
+
+      // Store generated helper call_fn into state
+      // pf->call_fn = &spawn_helper_call_fn;
+      Value *CallFn = CreateCallFn(CGF, CGF.CurFn);
+      StoreField(B, CallFn, PF, PendingFrameBuilder::call_fn);
+
+      // __cilkrts_detach_pending(pf); -- not yet
+      // B.CreateCall(CILKRTS_FUNC(detach_pending, CGF), PF);
+
+      // spawn_helper_issue_fn( pf, s ); -- not yet
+      // Value *IssueFn = GenerateDataflowIssueFn(CGF, State, CallInfo);
+      // B.CreateCall2(IssueFn, PF, S);
+
+      B.CreateRet(PF);
+  }
+
+  // Create the case where arguments are initially ready: stack frame
+  if( !bb_ready )
+      bb_ready = BasicBlock::Create(Ctx, "ready", Fn);
+  B.SetInsertPoint(bb_ready);
+
+  Value *ZF = ConstantPointerNull::get(
+      llvm::PointerType::getUnqual(PendingFrameBuilder::get(Ctx)));
+  B.CreateRet(ZF);
+
+  // Create the code that checks for an unsynced frame
+  B.SetInsertPoint(Entry);
+
+#if 0
+  // SKIP the check of the worker because this is already done in the
+  // calling function and the condition was false.
+
+  // First, insert a check to see if the parent's stack frame is SYNCHED.
+  // If SYNCHED, then no need to track dataflow dependences.
+  Value *Worker = B.CreateCall(CILKRTS_FUNC(get_tls_worker, CGF));
+
+  // Poll if parent is synced
+  Value *CurSF = LoadField(B, Worker, WorkerBuilder::current_stack_frame);
+  Value *Flags = LoadField(B, CurSF, StackFrameBuilder::flags);
+  Value *SFlag = B.CreateAnd(Flags,
+			     ConstantInt::get(Flags->getType(),
+					      CILK_FRAME_UNSYNCHED));
+  Value *Zero = Constant::getNullValue(SFlag->getType());
+
+  Value *ParentUnsynced = B.CreateICmpEQ(SFlag, Zero);
+  B.CreateCondBr(ParentUnsynced, bb_ready, Unsynced);
+#else
+  B.CreateBr(Unsynced);
+#endif
+}
+
+static void
+CreateIssueFn(CodeGenFunction &CGF,
+	      CallExpr::const_arg_iterator ArgBeg,
+	      CallExpr::const_arg_iterator ArgEnd) {
+  llvm::errs() << " *** CreateIssueFn ***\n";
+
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  CodeGenFunction::CGCilkDataflowSpawnInfo *Info
+      = cast<CodeGenFunction::CGCilkDataflowSpawnInfo >(CGF.CapturedStmtInfo);
+
+  const char * FnName = "__cilk_df_spawn_helper_issue_fn";
+
+  // Create the function. Type is:
+  // __cilkrts_pending_frame * ( __cilkrts_pending_frame *, void * )
+  llvm::FunctionType *FTy = TypeBuilder<__cilkrts_issue_fn_ty, false>::get(Ctx);
+  llvm::Function * Fn
+      = Function::Create(FTy, llvm::GlobalValue::InternalLinkage,
+			 FnName, &CGF.CGM.getModule());
+
+  Info->setIssueFn(Fn);
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+  BasicBlock *BBFAA = BasicBlock::Create(Ctx, "bbfaa", Fn);
+  BasicBlock *BBAdd = BasicBlock::Create(Ctx, "bbadd", Fn);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
+  Value *PF, *S, *Args, *Tags;
+
+  llvm::Type *Int32Ty = llvm::Type::getInt32Ty(Ctx);
+
+  {
+      CGBuilderTy B(Entry);
+
+      PF = Fn->arg_begin();
+      Value *SVoid = ++Fn->arg_begin();
+      S = B.CreateBitCast(SVoid, llvm::PointerType::getUnqual(Info->getSavedStateTy()));
+      Args = GEP(B, S, 0);
+      Tags = GEP(B, S, 1);
+
+      // Call __cilkrts_obj_metadata_add_task for every dataflow argument
+      unsigned i=0;
+      for( CallExpr::const_arg_iterator I=ArgBeg, E=ArgEnd; I != E; ++I ) {
+	  const clang::Type * type = I->getType().getTypePtr();
+	  if( IsDataflowType( type ) ) {
+	      Function * WrFn = CILKRTS_FUNC(obj_metadata_add_task_write, CGF);
+	      Value *Var = LoadField(B, GEP(B, Args, i), 0);
+	      Value *Meta = GEP(B, Var, ObjVersionBuilder::meta);
+	      // struct.__cilkrts_obj_metadata != __cilkrts_obj_metadata
+	      Value *CMeta = B.CreatePointerCast(Meta, (++WrFn->arg_begin())->getType());
+	      Value *Tag = GEP(B, Tags, i);
+	      if( CILK_OBJ_GROUP_WRITE == CILK_OBJ_GROUP_WRITE ) // TODO
+		  B.CreateCall3(WrFn, PF, CMeta, Tag);
+	      else
+		  B.CreateCall3(CILKRTS_FUNC(obj_metadata_add_task_read, CGF),
+				PF, CMeta, Tag);
+	      ++i;
+	  }
+      }
+
+      // if( pf ) { // Issue late starts with incoming on 0, no need to subtract
+
+      Value *PFNZ = B.CreateICmpNE(PF, ConstantPointerNull::get(
+				       cast<llvm::PointerType>(PF->getType())));
+      B.CreateCondBr(PFNZ, BBFAA, Exit);
+  }
+
+  //   if( __sync_fetch_and_add( &pf->incoming_count, -1 ) == 1 )
+  {
+      CGBuilderTy B(BBFAA);
+      Value *IC = GEP(B, PF, PendingFrameBuilder::incoming_count);
+      Value *FAA = B.CreateAtomicRMW(llvm::AtomicRMWInst::Add,
+				     IC, ConstantInt::get(Int32Ty, -1),
+				     AcquireRelease);
+      Value *Cond = B.CreateICmpEQ(FAA, ConstantInt::get(Int32Ty, 1));
+      B.CreateCondBr(Cond, BBAdd, Exit);
+  }
+
+  //      __cilkrts_obj_metadata_add_pending_to_ready_list( __cilkrts_get_tls_worker(), pf );
+  {
+      CGBuilderTy B(BBAdd);
+      Value *W = B.CreateCall(CILKRTS_FUNC(get_tls_worker, CGF));
+      B.CreateCall2(CILKRTS_FUNC(obj_metadata_add_pending_to_ready_list, CGF), W, PF);
+      B.CreateBr(Exit);
+  }
+
+  // }
+  {
+      CGBuilderTy B(Exit);
+      B.CreateRetVoid();
+  }
+
+  Fn->addFnAttr(Attribute::InlineHint);
+}
+
+static QualType
+GetDataflowTagType( ASTContext & Ctx, QualType qtype ) {
+    CXXRecordDecl * r = qtype.getTypePtr()->getAsCXXRecordDecl();
+    for( DeclContext::decl_iterator
+	     DI=r->decls_begin(), DE=r->decls_end(); DI != DE; ++DI ) {
+	Decl *D = *DI;
+	if( TypedefDecl * TD = dyn_cast<TypedefDecl>(D) ) {
+	    if( IdentifierInfo * id = TD->getIdentifier() )
+		if( id->isStr( "__tag_type" ) )
+		    return Ctx.getTypeDeclType(TD);
+	}
+    }
+    return QualType();
+}
+
 static const char *stack_frame_name = "__cilkrts_sf";
+static const char *pending_frame_name = "__cilkrts_pf";
+static const char *pending_frame_arg_name = "__cilkrts_pf_arg";
+static const char *helper_flag_name = "__cilkrts_helper_flag";
+static const char *saved_state_name = "__cilkrts_saved_state";
+static const char *saved_state_ptr_name = "__cilkrts_saved_state_ptr";
+static const char *parent_synced_name = "__cilkrts_parent_synced";
 
 static llvm::Value *LookupStackFrame(CodeGenFunction &CGF) {
   return CGF.CurFn->getValueSymbolTable().lookup(stack_frame_name);
+}
+
+static llvm::Value *LookupPendingFrame(CodeGenFunction &CGF) {
+  return CGF.CurFn->getValueSymbolTable().lookup(pending_frame_name);
+}
+
+static llvm::Value *LookupPendingFrameArg(CodeGenFunction &CGF) {
+  return CGF.CurFn->getValueSymbolTable().lookup(pending_frame_arg_name);
+}
+
+static llvm::Value *LookupHelperFlag(CodeGenFunction &CGF) {
+  return CGF.CurFn->getValueSymbolTable().lookup(helper_flag_name);
+}
+
+static llvm::Value *LookupSavedState(CodeGenFunction &CGF) {
+  return CGF.CurFn->getValueSymbolTable().lookup(saved_state_name);
+}
+
+static llvm::Value *LookupSavedStatePtr(CodeGenFunction &CGF) {
+  return CGF.CurFn->getValueSymbolTable().lookup(saved_state_ptr_name);
+}
+
+static llvm::Value *LookupParentSynced(CodeGenFunction &CGF) {
+  return CGF.CurFn->getValueSymbolTable().lookup(parent_synced_name);
 }
 
 /// \brief Create the __cilkrts_stack_frame for the spawning function.
@@ -1143,6 +1947,58 @@ void setHelperAttributes(CodeGenFunction &CGF,
 
   // The helper function *cannot* be inlined.
   Helper->addFnAttr(llvm::Attribute::NoInline);
+}
+
+/// HV:
+/// \brief Captures analysis information for a Dataflow spawn.
+///
+/*
+struct DataFlowSpawnInfo {
+    bool IsDataflow; ///< Is this a dataflow spawn, not a regular one?
+    
+    const CallExpr * Call; ///< The call statement of the spawn
+};
+*/
+
+/// HV:
+/// \brief Walk arguments of spawned function to detect dataflow.
+///
+bool isDataFlowSpawn(CodeGenFunction &CGF,
+		     const Stmt *S,
+		     CallExpr const * & the_spawn) {
+  FindSpawnCallExpr Finder(const_cast<Stmt *>(S));
+  assert(Finder.Spawn && "spawn call expected");
+
+  // Walk list of arguments. Note: could do this in two ways: either
+  // analyse types alone, or analyse values.
+  // Note: adding keywords to the type would probably be safer as the values
+  // themselves could be passed to calls without proper effects.
+  const Expr * const * args = Finder.Spawn->getArgs();
+  unsigned num_args = Finder.Spawn->getNumArgs();
+
+  the_spawn = Finder.Spawn;
+
+  // Is any of the arguments a dataflow type?
+  for( unsigned i=0; i < num_args; ++i ) {
+      const clang::Type * type = args[i]->getType().getTypePtr();
+      if( type->isRecordType() ) {
+	  if( const CXXRecordDecl * rdecl = type->getAsCXXRecordDecl() ) {
+	      // Does any of the methods of the struct/union/class have a
+	      // signature method name?
+	      for( CXXRecordDecl::method_iterator
+		       I=rdecl->method_begin(),
+		       E=rdecl->method_end(); I != E; ++I ) {
+		  FunctionDecl * m = *I;
+		  if( IdentifierInfo * id = m->getIdentifier() ) {
+		      if( id->isStr( "__Cilk_is_dataflow_type" ) )
+			  return true;
+		  }
+	      }
+	  }
+      }
+  }
+
+  return false;
 }
 
 } // anonymous
@@ -1223,17 +2079,20 @@ static void maybeCleanupBoundTemporary(CodeGenFunction &CGF,
     CGF.PushDestructorCleanup(Dtor, ReceiverTmp);
 }
 
+
 /// Generate an outlined function for the body of a CapturedStmt, store any
 /// captured variables into the captured struct, and call the outlined function.
 llvm::Function *
 CodeGenFunction::EmitSpawnCapturedStmt(const CapturedStmt &S,
                                        VarDecl *ReceiverDecl) {
+    llvm::errs() << " *** EmitSpawnCapturedStmt ***\n";
+
   const CapturedDecl *CD = S.getCapturedDecl();
   const RecordDecl *RD = S.getCapturedRecordDecl();
   assert(CD->hasBody() && "missing CapturedDecl body");
 
   LValue CapStruct = InitCapturedStruct(S);
-  SmallVector<Value *, 3> Args;
+  SmallVector<Value *, 4> Args;
   Args.push_back(CapStruct.getAddress());
 
   QualType ReceiverTmpType;
@@ -1249,9 +2108,37 @@ CodeGenFunction::EmitSpawnCapturedStmt(const CapturedStmt &S,
   }
 
   // Emit the CapturedDecl
+  const CallExpr * Spawn;
+  bool IsDataflow = isDataFlowSpawn( *this, &S, Spawn );
+  errs() << "is dataflow? " << ( IsDataflow ? "yes" : "no" ) << "\n";
+
   CodeGenFunction CGF(CGM, true);
-  CGF.CapturedStmtInfo = new CGCilkSpawnInfo(S, ReceiverDecl);
+  if( IsDataflow )
+      CGF.CapturedStmtInfo = new CGCilkDataflowSpawnInfo(S, ReceiverDecl, 0);
+  else
+      CGF.CapturedStmtInfo = new CGCilkSpawnInfo(S, ReceiverDecl);
   llvm::Function *F = CGF.GenerateCapturedStmtFunction(CD, RD, S.getLocStart());
+  if( IsDataflow ) {
+      // Intended to catch use in destructor call for spawn fn argument,
+      // but too indiscriminate...
+    // Patch up values to replace
+    CodeGenFunction::CGCilkDataflowSpawnInfo *Info =
+	dyn_cast<CodeGenFunction::CGCilkDataflowSpawnInfo>(CGF.CapturedStmtInfo);
+
+    // Rewrite the helper function. Any information about the Cilk spawn call
+    // being made has been saved in Info.
+    CGF.RewriteHelperFunction(Info, F);
+
+    // Create call function
+    // ExtractCallFn(Info, F);
+
+    LLVMContext &Ctx = getLLVMContext(); 
+    Value *PF = ConstantPointerNull::get(
+	llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx)));
+    Args.push_back(PF);
+    Value *flag = ConstantInt::get(llvm::Type::getInt1Ty(Ctx), 0);
+    Args.push_back(flag);
+  }
   delete CGF.CapturedStmtInfo;
 
   // Emit call to the helper function.
@@ -1265,6 +2152,406 @@ CodeGenFunction::EmitSpawnCapturedStmt(const CapturedStmt &S,
   return F;
 }
 
+void
+CodeGenFunction::
+ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
+				CallExpr::const_arg_iterator ArgEnd,
+				llvm::Type *CalleeType) {
+    llvm::errs() << " *** ConstructCilkDataflowSavedState ***\n";
+
+    LLVMContext &Ctx = getLLVMContext();
+
+    CGCilkDataflowSpawnInfo *Info
+	= cast<CGCilkDataflowSpawnInfo >(CapturedStmtInfo);
+
+    BasicBlock::iterator AllocaStart = ++Info->getSavedAllocaInsertPt();
+    BasicBlock::iterator AllocaEnd( &*AllocaInsertPt );
+
+    // Info ..
+    llvm::StructType *SavedStateTy;
+    unsigned SavedStateArgStart;
+    CGCilkDataflowSpawnInfo::ARMapTy &ReplaceValues = Info->getReplaceValues();
+
+    std::vector<llvm::Type *> SavedStateTypes;
+    std::vector<llvm::Type *> TagTypes;
+    llvm::errs() << "CGF === dump new alloca's:\n";
+    CallExpr::const_arg_iterator Arg = ArgBeg;
+    unsigned field = 0;
+    for( llvm::BasicBlock::iterator
+	     I=AllocaStart, E=AllocaEnd; I != E; ++I, ++field ) {
+	llvm::AllocaInst * Alloca = dyn_cast<llvm::AllocaInst>(&*I);
+	assert( Alloca && "Confused about Alloca's inserted" );
+
+	Alloca->dump();
+
+	// Define llvm::StructType with all relevant fields.
+	// All things requiring an alloca need to be saved in order to
+	// execute the call at a later stage, from a different caller.
+	llvm::PointerType *PTy = cast<llvm::PointerType>(Alloca->getType());
+	SavedStateTypes.push_back( PTy->getContainedType(0) );
+	ReplaceValues[Alloca] = CGCilkDataflowSpawnInfo::RemapInfo(field);
+
+	if( Arg != ArgEnd ) {
+	    if( IsDataflowType( Arg->getType().getTypePtr() ) )
+		TagTypes.push_back( TaskListNodeBuilder::get(Ctx) );
+	    ++Arg;
+	}
+    }
+
+    // All other arguments to the function call must be saved in the
+    // structure as well, i.e., ints, constants, ...
+    // Remember position of function arguments in StructType
+    SavedStateArgStart = SavedStateTypes.size();
+    {
+	llvm::PointerType * FnPtrTy
+	    = dyn_cast<llvm::PointerType>(CalleeType);
+	llvm::FunctionType * FnTy
+	    = dyn_cast<llvm::FunctionType>(FnPtrTy->getContainedType(0));
+	// llvm::FunctionType * FnTy = Info->getFunctionType();
+	assert( FnTy );
+	// Add return value, if any
+	if( !FnTy->getReturnType()->isVoidTy() ) {
+	    SavedStateTypes.push_back(
+		llvm::PointerType::getUnqual(FnTy->getReturnType()) );
+	    ReplaceValues[&CurFn->getArgumentList().back()]
+		= CGCilkDataflowSpawnInfo::RemapInfo(SavedStateArgStart);
+	    ++SavedStateArgStart;
+	}
+	// Add callee arguments
+	for( llvm::FunctionType::param_iterator
+		 I=FnTy->param_begin(),
+		 E=FnTy->param_end(); I != E; ++I ) {
+	    SavedStateTypes.push_back( *I );
+	}
+    }
+
+    llvm::Type *ElemTypes[2] = {
+	llvm::StructType::create( getLLVMContext(), SavedStateTypes, "args" ),
+	llvm::StructType::create( getLLVMContext(), TagTypes, "tags" )
+    };
+    SavedStateTy
+	= llvm::StructType::create( getLLVMContext(), ElemTypes,
+				    "__cilkrts_df_saved_state" );
+    // TODO: filter out redundant fields
+    // llvm::errs() << "CGF === dump SavedStateTy:\n";
+    // SavedStateTy->dump();
+
+    // Create the saved state
+    // TODO: Alignment
+    // TODO: must be part of pending frame if pending
+    llvm::AllocaInst *SavedStateIfReady
+	= new llvm::AllocaInst(SavedStateTy, saved_state_name, &*AllocaStart);
+    llvm::AllocaInst *SavedState
+	= new llvm::AllocaInst(
+	    llvm::PointerType::getUnqual(SavedStateTy),
+	    saved_state_ptr_name, &*AllocaStart);
+
+    // Initialize SavedState to point to the local alloca struct which will
+    // be used only in case all arguments are ready.
+    new StoreInst(SavedStateIfReady, SavedState, &*AllocaStart);
+
+    Info->setSavedState( SavedStateTy, SavedState, SavedStateArgStart );
+
+    // Replace each of the alloc's with a GEP from the saved state
+    llvm::Value * idx[2];
+    llvm::Type * Int32Ty = llvm::Type::getInt32Ty(getLLVMContext());
+    idx[0] = llvm::ConstantInt::get(Int32Ty, 0);
+    idx[1] = llvm::ConstantInt::get(Int32Ty, 0);
+    llvm::Instruction *Args
+	= llvm::GetElementPtrInst::Create(SavedStateIfReady, idx, "", &*AllocaStart);
+    for( CGCilkDataflowSpawnInfo::ARMapTy::iterator
+	     I=ReplaceValues.begin(), E=ReplaceValues.end();
+	 I != E; ++I ) {
+	if( isa<llvm::AllocaInst>(I->first) ) {
+	    llvm::AllocaInst * Alloca = cast<llvm::AllocaInst>(I->first);
+	    idx[1] = llvm::ConstantInt::get(Int32Ty, I->second.field);
+	    llvm::GetElementPtrInst *GEP = llvm::GetElementPtrInst::Create(
+		Args, idx, "", Alloca );
+
+	    // Alloca->replaceAllUsesWith(GEP); -- duplicate?
+	    I->second.GEP = GEP;
+	} else if( isa<llvm::Argument>(I->first) ) { // Return value
+	    if( I->second.field != SavedStateArgStart-1 ) {
+		llvm::BasicBlock::iterator ii(Args);
+		++ii;
+		idx[1] = llvm::ConstantInt::get(Int32Ty, I->second.field);
+		I->second.GEP =
+		    llvm::GetElementPtrInst::Create(Args, idx, "", &*ii);
+	    }
+	}
+
+	llvm::errs() << "replace value field=" << I->second.field << "\n";
+	I->first->dump();
+	if( I->second.GEP )
+	    I->second.GEP->dump();
+    }
+
+    // Emit the function call with the current arguments, referencing
+    // the individual alloca's for each of the arguments. We will replace
+    // these later.
+    llvm::errs() << " *** Done with ConstructCilkDataflowSavedState ***\n";
+
+    // Write the body of the ini_ready_fn() now that we know the arguments
+    CompleteIniReadyFn(*this, ArgBeg, ArgEnd);
+    CreateIssueFn(*this, ArgBeg, ArgEnd);
+}
+
+static void
+ReplaceAllReachableUses(std::set<BasicBlock *> &BBs, Value *Arg, Value *New) {
+    for( Value::use_iterator I=Arg->use_begin(), E=Arg->use_end();
+	I != E; ) {
+	Use &U = I.getUse();
+	++I; // early increment to survive potential destructive update
+	if( llvm::Instruction *UI = dyn_cast<llvm::Instruction>(U.getUser()) ) {
+	    if( BBs.find(UI->getParent()) != BBs.end() ) {
+		U.set(New);
+	    }
+	}
+    }
+}
+
+static void
+FindReachableBasicBlocks(std::set<BasicBlock *>&BBs, BasicBlock *From) {
+    std::stack<BasicBlock *> Work;
+    Work.push(From);
+
+    while( !Work.empty() ) {
+	BasicBlock *BB = Work.top();
+	Work.pop();
+
+	BBs.insert(BB);
+
+	for( succ_iterator I=succ_begin(BB), E=succ_end(BB); I != E; ++I ) {
+	    BasicBlock *S = *I;
+	    if( BBs.find(S) == BBs.end() )
+		Work.push(S);
+	}
+    }
+}
+
+void
+CodeGenFunction::
+RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
+		      llvm::Function *HelperFn) {
+    const CGFunctionInfo &CallInfo = *Info->getCallInfo();
+    RValue RV = Info->getRValue();
+
+    llvm::errs() << " *** RewriteHelperFunction ***\n";
+
+    llvm::LLVMContext &Ctx = getLLVMContext();
+
+    // Get the __cilkrts_stack_frame
+    Value *SF = LookupStackFrame(*this);
+    assert(SF && "null stack frame unexpected");
+
+    CGCilkDataflowSpawnInfo::ARMapTy &ReplaceValues = Info->getReplaceValues();
+    for( CGCilkDataflowSpawnInfo::ARMapTy::iterator I=ReplaceValues.begin(),
+	     E=ReplaceValues.end(); I != E; ++I ) {
+	// This leaves a dead Alloca instruction (LLVM will clean up)
+	if( I->second.GEP )
+	    I->first->replaceAllUsesWith(I->second.GEP);
+    }
+
+    unsigned NumArgs = 0;
+    llvm::Instruction * RVInst = dyn_cast<llvm::Instruction>(RV.getScalarVal());
+    assert(RVInst);
+    if( llvm::CallInst * TheCall = dyn_cast<llvm::CallInst>(RVInst) )
+	NumArgs = TheCall->getNumArgOperands();
+    else if( llvm::InvokeInst * TheInvoke = dyn_cast<llvm::InvokeInst>(RVInst) )
+	NumArgs = TheInvoke->getNumArgOperands();
+
+    /*
+    llvm::BasicBlock::iterator ii(RVInst);
+    llvm::BasicBlock * SaveBB = RVInst->getParent();
+    llvm::BasicBlock * ReloadBB
+	= SaveBB->splitBasicBlock(ii,"__cilk_reload_args");
+    // ii now invalid
+
+    Builder.SetInsertPoint(ReloadBB);
+    */
+
+    BasicBlock * ReloadBB = Info->getReloadBB();
+    BasicBlock * SaveBB = Info->getSaveBB();
+
+    // Erase terminator
+    // SaveBB->getTerminator()->eraseFromParent();
+
+    CGBuilderTy B1(BasicBlock::iterator(SaveBB->getTerminator()));
+    CGBuilderTy B2(RVInst);
+    llvm::Value * SavedState = Info->getSavedState();
+    unsigned SavedStateArgStart = Info->getSavedStateArgStart();
+
+    std::set<BasicBlock *> ReachableBBs;
+    FindReachableBasicBlocks(ReachableBBs, RVInst->getParent());
+
+    // GEP the args portion twice to facilitate cloning of the reload block
+    // into the call function
+    llvm::Value *SavedState1 = B1.CreateLoad(SavedState);
+    llvm::Value * ArgsSave =
+	B1.CreateConstInBoundsGEP2_32(SavedState1, 0, 0);
+    llvm::Value *SavedState2 = B2.CreateLoad(SavedState);
+    llvm::Value * ArgsReload =
+	B2.CreateConstInBoundsGEP2_32(SavedState2, 0, 0);
+
+    // Store and reload every call argument
+    llvm::Type *Int32Ty = llvm::Type::getInt32Ty(Ctx);
+    for( unsigned i=0, e=NumArgs; i != e; ++i ) {
+	llvm::Value * Arg = RVInst->getOperand(i);
+	llvm::Value *GEP1 =
+	    B1.CreateConstInBoundsGEP2_32(ArgsSave, 0, SavedStateArgStart+i);
+	B1.CreateStore(Arg, GEP1);
+
+	llvm::Value *RL2 = LoadField(B2, ArgsReload, SavedStateArgStart+i);
+	// RVInst->setOperand(i, RL2);
+	ReplaceAllReachableUses(ReachableBBs, Arg, RL2);
+    }
+}
+
+#if 0
+{
+    // On the spawn_helper (ready args) path, do some extra work
+
+    // Check for readiness and branch out if not ready
+    llvm::Value *PF = LookupPendingFrame(*this);
+
+    BasicBlock *PFDetach = BasicBlock::Create(Ctx, "__cilk_pf_detach", CurFn);
+    BasicBlock *SFDetach = BasicBlock::Create(Ctx, "__cilk_sf_detach", CurFn);
+    BasicBlock *SFCreate = BasicBlock::Create(Ctx, "__cilk_sf_create", CurFn);
+
+    // Fixup the paths out of the early check on the "flag" argument
+    if( BasicBlock *ReadyCheckBB=Info->getReloadBB() ) {
+	CGBuilderTy B(&CurFn->getEntryBlock());
+
+	// Check flag to see if we jump to reload_bb immediately or not
+	llvm::Function::arg_iterator Arg = CurFn->arg_begin();
+	std::advance(Arg, 3);
+	llvm::Value *Flag = Arg;
+
+	llvm::Value *DoCall
+	    = B.CreateICmpNE(Flag, ConstantInt::get(Flag->getType(), 0));
+	B.CreateCondBr(DoCall, ReloadBB, ReadyCheckBB);
+
+	{
+	    CGBuilderTy B(SaveBB);
+
+	    llvm::Value *PFZero
+		= B.CreateICmpNE(PF, ConstantPointerNull::get(
+				     cast<llvm::PointerType>(PF->getType())));
+	    B.CreateCondBr(PFZero, PFDetach, SFCreate);
+	}
+    }
+    Info->setReloadBB(ReloadBB);
+
+    {
+	// Detach stack frame and continue on to reload
+	CGBuilderTy B(SFDetach);
+
+	// __cilkrts_detach(sf);
+	B.CreateCall(CILKRTS_FUNC(detach, *this), SF);
+	B.CreateBr(ReloadBB);
+    }
+
+    {
+	// Detach of pending frame and return
+	CGBuilderTy B(PFDetach);
+
+	// pf->call_fn = &spawn_helper_call_fn;
+	Value *CallFn = CreateCallFn(*this, Info->getSavedStateTy(),
+				     HelperFn, CurFn);
+	Value *PFVoid = B.CreateBitCast(PF, llvm::PointerType::getUnqual(
+					    llvm:Type::getVoidTy(Ctx)));
+	StoreField(B, CallFn, PFVoid, PendingFrameBuilder::call_fn);
+
+	// spawn_helper_issue_fn(pf,pf->args_tags);
+	Value *IssueFn
+	    = 0; // GenerateDataflowIssueFn(*this, Info->getSavedStateTy(), CallInfo);
+	Value *SVoid = B.CreateBitCast(Info->getSavedState(), llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx)));
+	B.CreateCall2(IssueFn, PF, SVoid);
+
+	// __cilkrts_detach_pending(pf);
+	B.CreateCall(CILKRTS_FUNC(detach_pending, *this), PF);
+
+	// return;
+	B.CreateRetVoid();
+    }
+
+    // Modify terminator
+    {
+	CGBuilderTy B(SFCreate);
+
+	// sf->df_issue_fn = &spawn_helper_issue_fn; // -- args = (s)
+	Value *IssueFn
+	    = 0; // GenerateDataflowIssueFn(*this, Info->getSavedStateTy(), CallInfo);
+	StoreField(B, IssueFn, SF, StackFrameBuilder::df_issue_fn);
+
+	// sf->args_tags = (char *)s;
+	Value *SP = Info->getSavedState();
+	Value *S = B.CreateLoad(SP);
+	Value *SVoid = B.CreateBitCast(S, llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx)));
+	StoreField(B, SVoid, SF, StackFrameBuilder::args_tags);
+
+	// Link in task graph (before detach)
+	// if( !PARENT_SYNCED ) {
+	//    sf->flags |= CILK_FRAME_DATAFLOW_ISSUED;
+	//    spawn_helper_issue_fn( 0, s ); // TODO: sf->tags, sf->args, x );
+	//    assert( sf->call_parent->df_issue_child == 0 );
+	// } else
+	//    sf->call_parent->df_issue_child = sf;
+
+	BasicBlock *Sync = BasicBlock::Create(Ctx, "cilk.spawn.synced");
+	BasicBlock *Unsync = BasicBlock::Create(Ctx, "cilk.spawn.unsynced");
+	Value *CurSF;
+	{
+	    // TODO - integrate this with the ini_ready check result, which should move into this function
+
+	    // First, insert a check to see if the parent's stack frame is SYNCHED.
+	    // If SYNCHED, then no need to track dataflow dependences.
+	    Value *Worker = B.CreateCall(CILKRTS_FUNC(get_tls_worker, *this));
+
+	    // Poll if parent is synced
+	    CurSF = LoadField(B, Worker, WorkerBuilder::current_stack_frame);
+	    Value *Flags = LoadField(B, CurSF, StackFrameBuilder::flags);
+	    Value *SFlag = B.CreateAnd(Flags,
+				       ConstantInt::get(Flags->getType(),
+							CILK_FRAME_UNSYNCHED));
+	    Value *Zero = Constant::getNullValue(SFlag->getType());
+
+	    Value *ParentSynced = B.CreateICmpEQ(SFlag, Zero);
+	    ParentSynced->setName(parent_synced_name);
+
+	    B.CreateCondBr(ParentSynced, Sync, Unsync);
+	}
+
+	EmitBlock(Sync);
+	{
+	    CGBuilderTy &B = Builder;
+
+	    //    sf->flags |= CILK_FRAME_DATAFLOW_ISSUED;
+	    Value *Flags = LoadField(B, SF, StackFrameBuilder::flags);
+	    Value *SFlag
+		= B.CreateOr(Flags,
+			     ConstantInt::get(Flags->getType(),
+					      CILK_FRAME_DATAFLOW_ISSUED));
+	    StoreField(B, SFlag, SF, StackFrameBuilder::flags);
+
+	    //    spawn_helper_issue_fn( 0, s );
+	    Value *SFNull = ConstantPointerNull::get(llvm::PointerType::getUnqual(TypeBuilder<__cilkrts_pending_frame, false>::get(Ctx)));
+	    Value *S = B.CreateLoad(Info->getSavedState());
+	    Value *SVoid = B.CreateBitCast(S, llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx)));
+	    B.CreateCall2(IssueFn, SFNull, SVoid);
+
+	    B.CreateBr(SFDetach);
+	}
+
+	EmitBlock(Unsync);
+	{
+	    CGBuilderTy &B = Builder;
+	    StoreField(B, SF, CurSF, StackFrameBuilder::df_issue_child);
+	    B.CreateBr(SFDetach);
+	}
+    }
+}
+#endif
 
 /// \brief Emit a call to the __cilk_sync function.
 void CGCilkPlusRuntime::EmitCilkSync(CodeGenFunction &CGF) {
@@ -1352,15 +2639,130 @@ void CGCilkPlusRuntime::EmitCilkParentStackFrame(CodeGenFunction &CGF) {
 /// \brief Emit code to create a Cilk stack frame for the helper function and
 /// release it in the end.
 void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
+  llvm::LLVMContext &Ctx = CGF.getLLVMContext();
+
+  CodeGenFunction::CGCilkDataflowSpawnInfo *Info
+      = dyn_cast<CodeGenFunction::CGCilkDataflowSpawnInfo>(CGF.CapturedStmtInfo);
+
+  llvm::Type *Int8Ty = llvm::Type::getInt8Ty(Ctx);
+  llvm::Type *Int8PtrTy = llvm::PointerType::getUnqual(Int8Ty);
+  llvm::Type *Int32Ty = llvm::Type::getInt32Ty(Ctx);
+  llvm::Type *Int1Ty = llvm::Type::getInt1Ty(Ctx);
+
+  // The stack frame is common to both dataflow and non-dataflow cases
   llvm::Value *SF = CreateStackFrame(CGF);
 
-  // Initialize the worker to null. If this worker is still null on exit,
-  // then there is no stack frame constructed for spawning and there is no need
-  // to cleanup this stack frame.
-  CGF.Builder.CreateCall(GetCilkResetWorkerFn(CGF), SF);
+  if( Info ) {
+    // Need to avoid inclusion of this in the saved state
+    llvm::AllocaInst *SavedStateIfReady
+	= CGF.CreateTempAlloca(Int8PtrTy, "__cilkrts_saved_state");
+    llvm::AllocaInst *ParentSynced = CGF.CreateTempAlloca(Int1Ty, "");
+    ParentSynced->setName(parent_synced_name);
 
-  // Push cleanups associated to this stack frame initialization.
-  CGF.EHStack.pushCleanup<SpawnHelperStackFrameCleanup>(NormalAndEHCleanup, SF);
+    CGF.Builder.CreateStore(ConstantInt::get(Int1Ty, 0), ParentSynced);
+
+    // Check flag to see if we jump to reload_bb immediately or not
+    llvm::Value *Flag = LookupHelperFlag(CGF);
+
+    BasicBlock *IsFullBB = CGF.createBasicBlock("__cilk_is_full");
+    BasicBlock *CallFnBB = CGF.createBasicBlock("__cilk_call_fn.0");
+    BasicBlock *ReloadBB = CGF.createBasicBlock("__cilk_reload");
+    BasicBlock *SyncBB = CGF.createBasicBlock("__cilk_sync");
+    BasicBlock *UnsyncBB = CGF.createBasicBlock("__cilk_unsync");
+    BasicBlock *SaveStateBB = CGF.createBasicBlock("__cilk_save_state");
+    Info->setReloadBB(ReloadBB);
+
+    // If flag is 1, initialize stack frame, then reload arguments from saved
+    // state and call function.
+    Value *DoCall
+	= CGF.Builder.CreateICmpNE(Flag, ConstantInt::get(Flag->getType(), 0));
+    CGF.Builder.CreateCondBr(DoCall, CallFnBB, IsFullBB);
+	
+    CGF.EmitBlock(CallFnBB);
+    {
+	CGBuilderTy &B = CGF.Builder;
+	// Initialize the worker to null. If this worker is still null on exit,
+	// then there is no stack frame constructed for spawning and there is no
+	// need to cleanup this stack frame.
+	B.CreateCall(GetCilkResetWorkerFn(CGF), SF);
+	// Get current saved state from pending_frame argument.
+	llvm::Type *PFTy = TypeBuilder<__cilkrts_pending_frame *,false>::get(Ctx);
+	Value *PF = B.CreateBitCast(LookupPendingFrameArg(CGF), PFTy);
+	Value *AT = LoadField(B, PF, PendingFrameBuilder::args_tags);
+	B.CreateStore(AT, LookupSavedStatePtr(CGF));
+	// TODO: also initialize stack frame on this code path (enter_frame, detach)
+	B.CreateBr(ReloadBB);
+    }
+
+    // If flags is 0, select between a pending frame and a full frame.
+    CGF.EmitBlock(IsFullBB);
+    {
+	CGBuilderTy &B = CGF.Builder;
+
+	// If SYNCHED, then no need to track dataflow dependences.
+	Value *Worker = B.CreateCall(CILKRTS_FUNC(get_tls_worker, CGF));
+
+	// Poll if parent is synced
+	Value *CurSF
+	    = LoadField(B, Worker, WorkerBuilder::current_stack_frame);
+	Value *Flags = LoadField(B, CurSF, StackFrameBuilder::flags);
+	Value *SFlag = B.CreateAnd(Flags,
+				   ConstantInt::get(Flags->getType(),
+						    CILK_FRAME_UNSYNCHED));
+	Value *Zero = Constant::getNullValue(SFlag->getType());
+	Value *Cond = B.CreateICmpEQ(SFlag, Zero);
+	B.CreateStore(Cond, ParentSynced);
+	B.CreateCondBr(Cond, SyncBB, UnsyncBB);
+    }
+
+    // The parent frame is not synched. Check for pending frame.
+    CGF.EmitBlock(UnsyncBB);
+    {
+	CGBuilderTy &B = CGF.Builder;
+	llvm::Function *ReadyFn = CreateIniReadyFn(CGF);
+	llvm::Value *PF = CGF.Builder.CreateCall(ReadyFn, Info->getContextValue());
+	PF->setName(pending_frame_name);
+
+	BasicBlock *ElectBB = CGF.createBasicBlock("__cilk_elect_saved_state");
+
+	Value *PFNZ
+	    = B.CreateICmpNE(PF, ConstantPointerNull::get(
+				 cast<llvm::PointerType>(PF->getType())));
+	B.CreateCondBr(PFNZ, ElectBB, SaveStateBB);
+
+	CGF.EmitBlock(ElectBB);
+	Value *ArgsTags = LoadField(B, PF, PendingFrameBuilder::args_tags);
+	B.CreateStore(ArgsTags, SavedStateIfReady);
+	B.CreateBr(SaveStateBB);
+    }
+
+    // The parent frame is synched. Proceed with stack frame.
+    CGF.EmitBlock(SyncBB);
+    {
+	// Initialize the worker to null. If this worker is still null on exit,
+	// then there is no stack frame constructed for spawning and there is no
+	// need to cleanup this stack frame.
+	CGF.Builder.CreateCall(GetCilkResetWorkerFn(CGF), SF);
+    }
+
+    // From here on, we generate code to save the state, reload it and call
+    // function. We will need to patch up some control flow after the fact,
+    // particularly to skip the save state code and immediately jump to the
+    // reload code.
+    CGF.EmitBlock(SaveStateBB);
+
+    // Do this only once:
+    // Push cleanups associated to this stack frame initialization.
+    CGF.EHStack.pushCleanup<SpawnHelperStackFrameCleanup>(NormalAndEHCleanup, SF);
+  } else {
+    // Initialize the worker to null. If this worker is still null on exit,
+    // then there is no stack frame constructed for spawning and there is no
+    // need to cleanup this stack frame.
+    CGF.Builder.CreateCall(GetCilkResetWorkerFn(CGF), SF);
+
+    // Push cleanups associated to this stack frame initialization.
+    CGF.EHStack.pushCleanup<SpawnHelperStackFrameCleanup>(NormalAndEHCleanup, SF);
+  }
 }
 
 /// \brief Push an implicit sync to the EHStack. A call to __cilk_sync will be
@@ -1380,8 +2782,64 @@ void CGCilkPlusRuntime::EmitCilkHelperPrologue(CodeGenFunction &CGF) {
   Value *SF = LookupStackFrame(CGF);
   assert(SF && "null stack frame unexpected");
 
-  // Initialize the stack frame and detach
-  CGF.Builder.CreateCall(GetCilkHelperPrologue(CGF), SF);
+  CodeGenFunction::CGCilkDataflowSpawnInfo
+      *Info = dyn_cast<CodeGenFunction::CGCilkDataflowSpawnInfo>(
+	  CGF.CapturedStmtInfo);
+  if( Info ){
+      LLVMContext &Ctx = CGF.getLLVMContext();
+      // Initialize the stack frame and detach
+      // Create args_tags, store issue function and store args_tags
+      llvm::Function *IF = Info->getIssueFn(); // CreateIssueFn(CGF);
+      BasicBlock *SaveBB = CGF.Builder.GetInsertBlock();
+      BasicBlock *TermBB = CGF.createBasicBlock("__cilk_term");
+      Info->setSaveBB(SaveBB);
+      BasicBlock *ReloadBB = Info->getReloadBB();
+
+      // Terminate SaveBB with conditional branch to terminate
+      Value *Flag = LookupHelperFlag(CGF);
+      Value *Zero = ConstantInt::get(Flag->getType(), 0);
+      Value *Cond = CGF.Builder.CreateICmpNE(Flag, Zero);
+      CGF.Builder.CreateCondBr(Cond, TermBB, ReloadBB);
+
+      // Terminate. Exception handling code will be added to this.
+      CGF.EmitBlock(TermBB);
+      CGF.Builder.CreateRetVoid();
+
+      // Emit ReloadBB
+      CGF.EmitBlock(ReloadBB);
+      Value *AT = LookupSavedState(CGF);
+      Value *PS = CGF.Builder.CreateLoad(LookupParentSynced(CGF));
+      Value *PSCast
+	  = CGF.Builder.CreateZExt(PS, llvm::Type::getInt32Ty(Ctx));
+      Value *ATCast
+	  = CGF.Builder.CreateBitCast(AT, llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx)));
+      CGF.Builder.CreateCall4(GetCilkDataflowHelperPrologue(CGF),
+			      SF, ATCast, IF, PSCast);
+  } else {
+      // Initialize the stack frame and detach
+      CGF.Builder.CreateCall(GetCilkHelperPrologue(CGF), SF);
+  }
+}
+
+void CGCilkPlusRuntime::EmitCilkDataflowHelperStackFrame(CodeGenFunction &CGF,
+							 Stmt * S) {
+    assert( 0 );
+}
+
+void CGCilkPlusRuntime::
+EmitCilkHelperDataFlowPrologue(CodeGenFunction &CGF,
+			       const CGFunctionInfo &CallInfo,
+			       SmallVector<llvm::Value *, 16> & Args) {
+    llvm::errs() << " *** EmitCilkHelperDataFlowPrologue ***\n";
+
+    LLVMContext &Ctx = CGF.getLLVMContext();
+    CGBuilderTy &B = CGF.Builder;
+
+    CodeGenFunction::CGCilkDataflowSpawnInfo *Info =
+	dyn_cast<CodeGenFunction::CGCilkDataflowSpawnInfo>(CGF.CapturedStmtInfo);
+    assert(Info);
+
+    EmitCilkHelperPrologue(CGF); // Just as a place holder to see where this goes
 }
 
 /// \brief A utility function for finding the enclosing CXXTryStmt if exists.

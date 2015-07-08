@@ -58,7 +58,7 @@ RValue CodeGenFunction::EmitCXXMemberCall(const CXXMethodDecl *MD,
   RequiredArgs required = RequiredArgs::forPrototypePlus(FPT, Args.size());
   
   // And the rest of the call args.
-  EmitCallArgs(Args, FPT, ArgBeg, ArgEnd);
+  EmitCallArgs(Args, FPT, ArgBeg, ArgEnd, Callee->getType(), IsCilkSpawnCall);
 
   return EmitCall(CGM.getTypes().arrangeCXXMethodCall(Args, FPT, required),
                   Callee, ReturnValue, Args, MD, /*callOrInvoke=*/0,
@@ -277,7 +277,8 @@ CodeGenFunction::EmitCXXMemberPointerCallExpr(const CXXMemberCallExpr *E,
   RequiredArgs required = RequiredArgs::forPrototypePlus(FPT, 1);
   
   // And the rest of the call args
-  EmitCallArgs(Args, FPT, E->arg_begin(), E->arg_end());
+  EmitCallArgs(Args, FPT, E->arg_begin(), E->arg_end(), Callee->getType(),
+	       E->isCilkSpawnCall());
   return EmitCall(CGM.getTypes().arrangeCXXMethodCall(Args, FPT, required), Callee, 
                   ReturnValue, Args, /*TargetDecl=*/0, /*callOrInvoke=*/0,
                   E->isCilkSpawnCall());

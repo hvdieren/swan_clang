@@ -3246,10 +3246,11 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType, llvm::Value *Callee,
 
   CallArgList Args;
   EmitCallArgs(Args, dyn_cast<FunctionProtoType>(FnType), ArgBeg, ArgEnd,
-               ForceColumnInfo);
+	       Callee->getType(), IsCilkSpawnCall, ForceColumnInfo);
 
   const CGFunctionInfo &FnInfo =
-    CGM.getTypes().arrangeFreeFunctionCall(Args, FnType);
+      CGM.getTypes().arrangeFreeFunctionCall(Args, FnType);
+
 
   // C99 6.5.2.2p6:
   //   If the expression that denotes the called function has a type
@@ -3274,8 +3275,18 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType, llvm::Value *Callee,
     Callee = Builder.CreateBitCast(Callee, CalleeTy, "callee.knr.cast");
   }
 
-  return EmitCall(FnInfo, Callee, ReturnValue, Args, TargetDecl,
-                  /*callOrInvoke=*/0, IsCilkSpawnCall);
+  RValue RV = EmitCall(FnInfo, Callee, ReturnValue, Args, TargetDecl,
+		       /*callOrInvoke=*/0, IsCilkSpawnCall);
+
+  if( IsCilkSpawnCall && CapturedStmtInfo ) {
+      if( CGCilkDataflowSpawnInfo * Info
+	  = dyn_cast<CGCilkDataflowSpawnInfo>(CapturedStmtInfo) )
+	  // RewriteHelperFunction(FnInfo, RV);
+	  Info->recordRValue(&FnInfo, RV);
+	  
+  }
+
+  return RV;
 }
 
 LValue CodeGenFunction::

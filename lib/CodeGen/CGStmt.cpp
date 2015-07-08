@@ -1865,6 +1865,23 @@ CodeGenFunction::GenerateCapturedStmtFunction(const CapturedDecl *CD,
   FunctionArgList Args;
   Args.append(CD->param_begin(), CD->param_end());
 
+  // Cilk dataflow spawns require additional arguments
+  if( isa<CGCilkDataflowSpawnInfo>(CapturedStmtInfo) ) {
+      SourceLocation Loc = CD->getBody()->getLocStart();
+      QualType PFType = Ctx.getPointerType(Ctx.VoidTy);
+      VarDecl *PFDecl
+	  = VarDecl::Create(Ctx, (*CD->param_begin())->getDeclContext(), Loc, Loc,
+			    &Ctx.Idents.get("__cilkrts_pf_arg"), PFType,
+			    Ctx.getTrivialTypeSourceInfo(PFType), SC_None);
+      Args.push_back(PFDecl);
+      QualType FlagType = Ctx.BoolTy;
+      VarDecl *FlagDecl
+	  = VarDecl::Create(Ctx, (*CD->param_begin())->getDeclContext(), Loc, Loc,
+			    &Ctx.Idents.get("__cilkrts_helper_flag"), FlagType,
+			    Ctx.getTrivialTypeSourceInfo(FlagType), SC_None);
+      Args.push_back(FlagDecl);
+  }
+
   // Create the function declaration.
   FunctionType::ExtInfo ExtInfo;
   const CGFunctionInfo &FuncInfo =
@@ -2173,6 +2190,7 @@ CodeGenFunction::CGCilkSpawnInfo::EmitBody(CodeGenFunction &CGF, Stmt *S) {
       Info->setReceiverTmp(A);
   }
 
+  // CGF.CGM.getCilkPlusRuntime().EmitCilkDataflowHelperStackFrame(CGF, S);
   CGF.CGM.getCilkPlusRuntime().EmitCilkHelperStackFrame(CGF);
   CGCapturedStmtInfo::EmitBody(CGF, S);
 }

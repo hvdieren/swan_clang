@@ -475,8 +475,9 @@ public:
 
   class CGCilkSpawnInfo : public CGCapturedStmtInfo {
   public:
-    explicit CGCilkSpawnInfo(const CapturedStmt &S, VarDecl *VD)
-      : CGCapturedStmtInfo(S, CR_CilkSpawn), ReceiverDecl(VD) { }
+    explicit CGCilkSpawnInfo(const CapturedStmt &S, VarDecl *VD,
+			     CapturedRegionKind CK=CR_CilkSpawn)
+	: CGCapturedStmtInfo(S, CK), ReceiverDecl(VD) { }
 
     virtual void EmitBody(CodeGenFunction &CGF, Stmt *S);
     virtual StringRef getHelperName() const { return "__cilk_spawn_helper"; }
@@ -494,7 +495,8 @@ public:
 
     static bool classof(const CGCilkSpawnInfo *) { return true; }
     static bool classof(const CGCapturedStmtInfo *I) {
-      return I->getKind() == CR_CilkSpawn;
+      return I->getKind() == CR_CilkSpawn
+	  || I->getKind() == CR_CilkDataflowSpawn;
     }
   private:
     /// \brief The receiver declariation.
@@ -506,6 +508,102 @@ public:
     /// \brief The address of the receiver temporary.
     llvm::Value *ReceiverTmp;
   };
+
+  class CGCilkDataflowSpawnInfo : public CGCilkSpawnInfo {
+  public:
+    struct RemapInfo {
+      llvm::GetElementPtrInst *GEP;
+      unsigned field;
+
+      RemapInfo(unsigned f=0) : GEP(0), field(f) { }
+    };
+    typedef std::map<llvm::Value *, RemapInfo> ARMapTy;
+
+    explicit CGCilkDataflowSpawnInfo(const CapturedStmt &S, VarDecl *VD,
+				     RecordDecl *RD)
+	: CGCilkSpawnInfo(S, VD, CR_CilkDataflowSpawn), // DataflowState(RD) { }
+	  SavedStateTy(0), SavedState(0), SavedStateArgStart(0), ReloadBB(0),
+	  SaveBB(0), IniReadyFn(0), IssueFn(0) { }
+
+      // virtual void EmitBody(CodeGenFunction &CGF, Stmt *S);
+    virtual StringRef getHelperName() const { return "__cilk_df_spawn_helper"; }
+
+    bool isDataflowSpawn() const { return true; }
+    RecordDecl *getDataflowState() const { return 0; } // DataflowState; }
+
+      void setDataflowAddress(llvm::Value *val) { } // DataflowAddr = val; }
+      llvm::Value *getDataflowAddress() const { return 0; } // DataflowAddr; }
+
+    void recordAllocaInsertPt(llvm::Instruction * Pt) {
+	SavedAllocaInsertPt = --llvm::BasicBlock::iterator(Pt);
+    }
+    llvm::BasicBlock::iterator getSavedAllocaInsertPt() const {
+	return SavedAllocaInsertPt;
+    }
+
+    llvm::StructType *getSavedStateTy() const { return SavedStateTy; }
+    llvm::AllocaInst *getSavedState() const { return SavedState; }
+    unsigned getSavedStateArgStart() const { return SavedStateArgStart; }
+
+    void setIssueFn(llvm::Function *IRFn) { IssueFn = IRFn; }
+    llvm::Function *getIssueFn() const { return IssueFn; }
+
+    void setIniReadyFn(llvm::Function *IRFn) { IniReadyFn = IRFn; }
+    llvm::Function *getIniReadyFn() const { return IniReadyFn; }
+
+    void setSavedState(llvm::StructType *STy, llvm::AllocaInst *S,
+		       unsigned Start) {
+	SavedStateTy = STy;
+	SavedState = S;
+	SavedStateArgStart = Start;
+    }
+    void setReloadBB(llvm::BasicBlock *rBB) { ReloadBB=rBB; }
+    llvm::BasicBlock *getReloadBB() const { return ReloadBB; }
+
+    void setSaveBB(llvm::BasicBlock *rBB) { SaveBB=rBB; }
+    llvm::BasicBlock *getSaveBB() const { return SaveBB; }
+
+      // llvm::FunctionType * getFunctionType() const { return FnTy; };
+      // void setFunctionType(llvm::FunctionType *FT) { FnTy = FT; };
+
+    ARMapTy &getReplaceValues() { return ReplaceValues; }
+
+      RValue getRValue() const { return RV; }
+      const CGFunctionInfo *getCallInfo() const { return CallInfo; }
+
+      void recordRValue(const CGFunctionInfo * I, RValue RVal) {
+	  CallInfo = I;
+	  RV = RVal;
+      }
+
+    static bool classof(const CGCilkSpawnInfo *) { return true; }
+    static bool classof(const CGCilkDataflowSpawnInfo *) { return true; }
+    static bool classof(const CGCapturedStmtInfo *I) {
+      return I->getKind() == CR_CilkDataflowSpawn;
+    }
+  private:
+    /// \brief Record definition of dataflow arguments or null?
+    // RecordDecl *DataflowState;
+
+    /// \brief The address the above record for this function.
+    // llvm::Value *DataflowAddr;
+
+    /// \brief Saved AllocaInsertPt prior to emitting call args
+    llvm::BasicBlock::iterator SavedAllocaInsertPt;
+
+    llvm::StructType *SavedStateTy;
+    llvm::AllocaInst *SavedState;
+    unsigned SavedStateArgStart;
+    ARMapTy ReplaceValues;
+      // llvm::FunctionType *FnTy;
+    llvm::BasicBlock *ReloadBB;
+    llvm::BasicBlock *SaveBB;
+    llvm::Function *IniReadyFn;
+    llvm::Function *IssueFn;
+      RValue RV;
+      const CGFunctionInfo * CallInfo;
+  };
+
 
   /// \brief Information about implicit syncs used during code generation.
   CGCilkImplicitSyncInfo *CurCGCilkImplicitSyncInfo;
@@ -2860,12 +2958,21 @@ private:
   void EmitCallArgs(CallArgList& Args, const T* CallArgTypeInfo,
                     CallExpr::const_arg_iterator ArgBeg,
                     CallExpr::const_arg_iterator ArgEnd,
+		    llvm::Type * CalleeType,
+		    bool IsCilkSpawnCall,
                     bool ForceColumnInfo = false) {
     CGDebugInfo *DI = getDebugInfo();
     SourceLocation CallLoc;
     if (DI) CallLoc = DI->getLocation();
 
     CallExpr::const_arg_iterator Arg = ArgBeg;
+
+    if( IsCilkSpawnCall && CapturedStmtInfo ) {
+	CGCilkDataflowSpawnInfo * CGI
+	    = dyn_cast_or_null<CGCilkDataflowSpawnInfo>(CapturedStmtInfo);
+	if( CGI )
+	    CGI->recordAllocaInsertPt(&*AllocaInsertPt);
+    }
 
     // First, use the argument types that the type info knows about
     if (CallArgTypeInfo) {
@@ -2914,7 +3021,16 @@ private:
       // Restore the debug location.
       if (DI) DI->EmitLocation(Builder, CallLoc, ForceColumnInfo);
     }
+
+    if( IsCilkSpawnCall && CapturedStmtInfo
+	&& CGCilkDataflowSpawnInfo::classof(CapturedStmtInfo) )
+	ConstructCilkDataflowSavedState(ArgBeg, ArgEnd, CalleeType);
   }
+
+  void ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
+				       CallExpr::const_arg_iterator ArgEnd,
+				       llvm::Type *CalleeType);
+    void RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info, llvm::Function *HelperFn); // const CGFunctionInfo &CallInfo, RValue RV);
 
   const TargetCodeGenInfo &getTargetHooks() const {
     return CGM.getTargetCodeGenInfo();
