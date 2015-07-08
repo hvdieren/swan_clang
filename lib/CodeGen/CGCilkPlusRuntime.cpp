@@ -1581,6 +1581,55 @@ CreateCallFn(CodeGenFunction &CGF, llvm::Function * HelperF) {
 }
 
 static llvm::Function *
+CreateHelperFn(CodeGenFunction &CGF, llvm::Function * MultiF) {
+    llvm::Module &Module = CGF.CGM.getModule();
+    LLVMContext &Ctx = CGF.getLLVMContext();
+    llvm::Type * Int1Ty = llvm::Type::getInt1Ty(Ctx);
+    llvm::Type * Int32Ty = llvm::Type::getInt32Ty(Ctx);
+
+    // Create HelperFn
+    unsigned NumArgs = std::distance(MultiF->arg_begin(), MultiF->arg_end());
+    NumArgs -= 2; // Final arguments are the pending frame and the flag (Int1Ty)
+    SmallVector<llvm::Type *, 3> params(NumArgs);
+    {
+	unsigned i=0;
+	for( llvm::Function::arg_iterator
+	    I=MultiF->arg_begin(), E=MultiF->arg_end();
+	     I != E && i < NumArgs; ++I, ++i ) {
+	    params[i] = I->getType();
+	}
+    }
+    llvm::FunctionType *FTy = llvm::FunctionType::get(
+	llvm::Type::getVoidTy(Ctx), params, false);
+    llvm::Function *HelperFn
+	= llvm::Function::Create(FTy, llvm::GlobalValue::InternalLinkage,
+				 "__cilkrts_df_spawn_helper", &Module);
+
+    // Call the multi-function.
+    BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", HelperFn);
+    CGBuilderTy B(Entry);
+
+    SmallVector<llvm::Value *, 5> Args;
+    // Common arguments: Capture argument struct, receiver (if present)
+    for( llvm::Function::arg_iterator
+	     I=HelperFn->arg_begin(), E=HelperFn->arg_end(); I != E; ++I )
+	Args.push_back(I);
+    
+    // Penultimate argument: pending_frmae
+    Value *PF = ConstantPointerNull::get(
+	llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx)));
+    Args.push_back(PF);
+    // Final argument: helper_flag
+    Args.push_back(ConstantInt::get(Int1Ty, 0));
+
+    B.CreateCall(MultiF, Args);
+    // TODO: Call release function -- in exception path?
+    B.CreateRetVoid();
+
+    return HelperFn;
+}
+
+static llvm::Function *
 CreateIniReadyFn(CodeGenFunction &CGF) {
   LLVMContext &Ctx = CGF.getLLVMContext();
 
@@ -2130,15 +2179,11 @@ CodeGenFunction::EmitSpawnCapturedStmt(const CapturedStmt &S,
     // being made has been saved in Info.
     CGF.RewriteHelperFunction(Info, F);
 
-    // Create call function
-    // ExtractCallFn(Info, F);
+    // Set inline hint on the multi-function
+    F->addFnAttr(Attribute::AlwaysInline);
 
-    LLVMContext &Ctx = getLLVMContext(); 
-    Value *PF = ConstantPointerNull::get(
-	llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx)));
-    Args.push_back(PF);
-    Value *flag = ConstantInt::get(llvm::Type::getInt1Ty(Ctx), 0);
-    Args.push_back(flag);
+    // Create wrapper helper function
+    F = CreateHelperFn(CGF, F);
   }
   delete CGF.CapturedStmtInfo;
 

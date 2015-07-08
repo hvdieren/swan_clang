@@ -526,7 +526,7 @@ public:
 	  SaveBB(0), IniReadyFn(0), IssueFn(0) { }
 
       // virtual void EmitBody(CodeGenFunction &CGF, Stmt *S);
-    virtual StringRef getHelperName() const { return "__cilk_df_spawn_helper"; }
+    virtual StringRef getHelperName() const { return "__cilk_df_spawn_helper_multi"; }
 
     bool isDataflowSpawn() const { return true; }
     RecordDecl *getDataflowState() const { return 0; } // DataflowState; }
