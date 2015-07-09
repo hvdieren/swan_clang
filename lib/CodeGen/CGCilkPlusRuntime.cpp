@@ -115,6 +115,8 @@ typedef void (cilk_func)(__cilkrts_stack_frame *);
 
 typedef uint32_t (__cilkrts_obj_metadata_ini_ready)(__cilkrts_obj_metadata * meta,
 						    uint32_t g);
+typedef void (__cilkrts_obj_metadata_wakeup_args)(__cilkrts_ready_list *,
+						  __cilkrts_obj_metadata * meta);
 typedef __cilkrts_pending_frame *(__cilkrts_pending_frame_create)(uint32_t);
 typedef void (__cilkrts_pending_call_fn)(__cilkrts_pending_frame *);
 typedef void (__cilkrts_obj_metadata_add_task_read)(__cilkrts_pending_frame *,
@@ -125,8 +127,11 @@ typedef void (__cilkrts_obj_metadata_add_task_write)(__cilkrts_pending_frame *,
 						     __cilkrts_task_list_node *);
 typedef void (__cilkrts_obj_metadata_add_pending_to_ready_list)(
     __cilkrts_worker *, __cilkrts_pending_frame *);
+typedef void (__cilkrts_move_to_ready_list)(
+    __cilkrts_worker *, __cilkrts_ready_list *);
 typedef void (__cilkrts_detach_pending)(__cilkrts_pending_frame *sf);
 typedef void (__cilkrts_issue_fn_ty)(__cilkrts_pending_frame *, void *);
+typedef void (__cilkrts_release_fn_ty)(void *);
 typedef void (__cilkrts_df_helper_fn_ty)(__cilkrts_stack_frame *, char *,
 					 __cilkrts_issue_fn_ty *, int);
 } // namespace
@@ -1401,6 +1406,84 @@ static llvm::Function *GetCilkHelperEpilogue(CodeGenFunction &CGF) {
   return Fn;
 }
 
+/// \brief Get or create a LLVM function for __cilk_dataflow_helper_epilogue.
+/// It is equivalent to the following C code
+///
+/// void __cilk_dataflow_helper_epilogue(__cilkrts_stack_frame *sf) {
+///   Probably sf->worker != 0 means full frame...
+///   if (sf->worker) {
+///     __cilkrts_pop_frame(sf);
+///     bool do_release = false;
+///     if(sf->flags & CILK_FRAME_DATAFLOW_ISSUED)
+///        do_release = true;
+///     else {
+///        __cilkrts_stack_frame *parent = sf->worker->current_stack_frame;
+///        __cilkrts_stack_frame *to_issue;
+///        to_issue = CAS(&parent->df_issue_child, sf, 0);
+///        do_release = to_issue != sf;
+///     }
+///     if(do_release)
+///        __cilkrts_df_spawn_helper_release_fn(sf->args_tags);
+///     __cilkrts_leave_frame(sf);
+///   }
+/// }
+static llvm::Function *
+GetCilkDataflowHelperEpilogue(CodeGenFunction &CGF) {
+  Function *Fn = 0;
+
+  if (GetOrCreateFunction<cilk_func>("__cilk_dataflow_helper_epilogue", CGF, Fn))
+    return Fn;
+
+  CodeGenFunction::CGCilkDataflowSpawnInfo *Info =
+      dyn_cast<CodeGenFunction::CGCilkDataflowSpawnInfo>(CGF.CapturedStmtInfo);
+  llvm::Function *ReleaseFn = Info->getReleaseFn();
+
+  // If we get here we need to add the function body
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  Value *SF = Fn->arg_begin();
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+  BasicBlock *Body = BasicBlock::Create(Ctx, "body", Fn);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
+
+  // Entry
+  {
+    CGBuilderTy B(Entry);
+
+    // if (sf->worker)
+    Value *C = B.CreateIsNotNull(LoadField(B, SF, StackFrameBuilder::worker));
+    B.CreateCondBr(C, Body, Exit);
+  }
+
+  // Body
+  {
+    CGBuilderTy B(Body);
+
+    // __cilkrts_pop_frame(sf);
+    B.CreateCall(CILKRTS_FUNC(pop_frame, CGF), SF);
+
+    // release
+    B.CreateCall(ReleaseFn, LoadField(B, SF, StackFrameBuilder::args_tags));
+
+    // __cilkrts_leave_frame(sf);
+    B.CreateCall(CILKRTS_FUNC(leave_frame, CGF), SF);
+
+    B.CreateBr(Exit);
+  }
+
+  // Exit
+  {
+    CGBuilderTy B(Exit);
+    B.CreateRetVoid();
+  }
+
+  Fn->addFnAttr(Attribute::InlineHint);
+
+  return Fn;
+}
+
+
 /// \brief Get or create a LLVM function for __cilkrts_obj_metadata_ini_ready.
 /// It is equivalent to the following C code
 ///
@@ -1474,6 +1557,67 @@ static Function *Get__cilkrts_obj_metadata_ini_ready(CodeGenFunction &CGF) {
 
   return Fn;
 }
+
+/// \brief Get or create a LLVM function for __cilkrts_obj_metadata_wakeup_args.
+/// It is equivalent to the following C code
+///
+/// void __cilkrts_obj_metadata_wakeup_args(struct __cilkrts_ready_list *rlist,
+///                                         struct __cilkrts_obj_metadata *meta ) {
+///   ...
+/// }
+static Function *Get__cilkrts_obj_metadata_wakeup_args(CodeGenFunction &CGF) {
+  Function *Fn = 0;
+
+  if (GetOrCreateFunction<__cilkrts_obj_metadata_wakeup_args>(
+	  "__cilkrts_obj_metadata_wakeup_args", CGF, Fn))
+    return Fn;
+
+  // If we get here we need to add the function body
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  Value * rlist = Fn->arg_begin();
+  Value * meta = ++Fn->arg_begin();
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+
+  CGBuilderTy B(Entry);
+  B.CreateRetVoid();
+
+  Fn->addFnAttr(Attribute::InlineHint);
+ 
+  return Fn;
+}
+
+/// \brief Get or create a LLVM function for __cilkrts_move_to_ready_list.
+/// It is equivalent to the following C code
+///
+/// void __cilkrts_move_to_ready_list(__cilkrts_worker *w,
+///                                   struct __cilkrts_ready_list *rlist) {
+///   ...
+/// }
+static Function *Get__cilkrts_move_to_ready_list(CodeGenFunction &CGF) {
+  Function *Fn = 0;
+
+  if (GetOrCreateFunction<__cilkrts_move_to_ready_list>(
+	  "__cilkrts_move_to_ready_list", CGF, Fn))
+    return Fn;
+
+  // If we get here we need to add the function body
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  Value * rlist = Fn->arg_begin();
+  Value * meta = ++Fn->arg_begin();
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+
+  CGBuilderTy B(Entry);
+  B.CreateRetVoid();
+
+  Fn->addFnAttr(Attribute::InlineHint);
+ 
+  return Fn;
+}
+
 
 /// \brief Get or create a LLVM function for __cilkrts_obj_metadata_ini_ready.
 /// It is equivalent to the following C code
@@ -1874,6 +2018,157 @@ CreateIssueFn(CodeGenFunction &CGF,
   Fn->addFnAttr(Attribute::InlineHint);
 }
 
+static llvm::Function *
+CreateReleaseFn(CodeGenFunction &CGF,
+		CallExpr::const_arg_iterator ArgBeg,
+		CallExpr::const_arg_iterator ArgEnd) {
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  CodeGenFunction::CGCilkDataflowSpawnInfo *Info
+      = cast<CodeGenFunction::CGCilkDataflowSpawnInfo >(CGF.CapturedStmtInfo);
+
+  const char * FnName = "__cilk_df_spawn_helper_release_fn";
+
+  // Create the function. Type is:
+  // void (*)( void * )
+  llvm::FunctionType *FTy
+      = TypeBuilder<__cilkrts_release_fn_ty, false>::get(Ctx);
+  llvm::Function * Fn
+      = Function::Create(FTy, llvm::GlobalValue::InternalLinkage,
+			 FnName, &CGF.CGM.getModule());
+
+  Info->setReleaseFn(Fn);
+
+  llvm::Type *Int32Ty = llvm::Type::getInt32Ty(Ctx);
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+
+  CGBuilderTy B(Entry);
+
+  // Create empty list
+  llvm::AllocaInst *RList = B.CreateAlloca(
+      TypeBuilder<__cilkrts_ready_list, false>::get(Ctx));
+
+  // Recover the worker
+  Value *W = B.CreateCall(CILKRTS_FUNC(get_tls_worker, CGF));
+
+  // Initialize ready list as an empty list
+  Value *Null = ConstantPointerNull::get(
+      TypeBuilder<__cilkrts_pending_frame *, false>::get(Ctx));
+  StoreField(B, Null, RList, ReadyListBuilder::dummy);
+  StoreField(B, Null, RList, ReadyListBuilder::tail);
+
+  // Get the args and tags
+  Value *SVoid = Fn->arg_begin();
+  Value *S
+      = B.CreateBitCast(SVoid,
+			llvm::PointerType::getUnqual(Info->getSavedStateTy()));
+  Value *Args = GEP(B, S, 0);
+  Value *Tags = GEP(B, S, 1);
+
+  // Call __cilkrts_obj_metadata_wakeup_args for every dataflow argument
+  unsigned i=0;
+  for( CallExpr::const_arg_iterator I=ArgBeg, E=ArgEnd; I != E; ++I ) {
+      const clang::Type * type = I->getType().getTypePtr();
+      if( IsDataflowType( type ) ) {
+	  Function * WrFn = CILKRTS_FUNC(obj_metadata_wakeup_args, CGF);
+	  Value *Var = LoadField(B, GEP(B, Args, i), 0);
+	  Value *Meta = GEP(B, Var, ObjVersionBuilder::meta);
+	  // struct.__cilkrts_obj_metadata != __cilkrts_obj_metadata
+	  Value *CMeta = B.CreatePointerCast(Meta, (++WrFn->arg_begin())->getType());
+	  Value *Tag = GEP(B, Tags, i);
+	  // TODO: This call could be slightly more efficient if we knew it was
+	  // read or write because with write you know that the generation
+	  // (should) drop empty.
+	  B.CreateCall2(WrFn, RList, CMeta);
+	  ++i;
+      }
+  }
+
+  // Move any ready tasks to the worker's ready list (splice)
+  B.CreateCall2(CILKRTS_FUNC(move_to_ready_list, CGF), W, RList);
+
+  // All done!
+  B.CreateRetVoid();
+
+  Fn->addFnAttr(Attribute::InlineHint);
+
+  return Fn;
+}
+
+
+#if 0
+{
+  BasicBlock *BBFAA = BasicBlock::Create(Ctx, "bbfaa", Fn);
+  BasicBlock *BBAdd = BasicBlock::Create(Ctx, "bbadd", Fn);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
+  Value *PF, *S, *Args, *Tags;
+
+  {
+      CGBuilderTy B(Entry);
+
+      PF = Fn->arg_begin();
+      Value *SVoid = ++Fn->arg_begin();
+      S = B.CreateBitCast(SVoid, llvm::PointerType::getUnqual(Info->getSavedStateTy()));
+      Args = GEP(B, S, 0);
+      Tags = GEP(B, S, 1);
+
+      // Call __cilkrts_obj_metadata_add_task for every dataflow argument
+      unsigned i=0;
+      for( CallExpr::const_arg_iterator I=ArgBeg, E=ArgEnd; I != E; ++I ) {
+	  const clang::Type * type = I->getType().getTypePtr();
+	  if( IsDataflowType( type ) ) {
+	      Function * WrFn = CILKRTS_FUNC(obj_metadata_add_task_write, CGF);
+	      Value *Var = LoadField(B, GEP(B, Args, i), 0);
+	      Value *Meta = GEP(B, Var, ObjVersionBuilder::meta);
+	      // struct.__cilkrts_obj_metadata != __cilkrts_obj_metadata
+	      Value *CMeta = B.CreatePointerCast(Meta, (++WrFn->arg_begin())->getType());
+	      Value *Tag = GEP(B, Tags, i);
+	      if( CILK_OBJ_GROUP_WRITE == CILK_OBJ_GROUP_WRITE ) // TODO
+		  B.CreateCall3(WrFn, PF, CMeta, Tag);
+	      else
+		  B.CreateCall3(CILKRTS_FUNC(obj_metadata_add_task_read, CGF),
+				PF, CMeta, Tag);
+	      ++i;
+	  }
+      }
+
+      // if( pf ) { // Issue late starts with incoming on 0, no need to subtract
+
+      Value *PFNZ = B.CreateICmpNE(PF, ConstantPointerNull::get(
+				       cast<llvm::PointerType>(PF->getType())));
+      B.CreateCondBr(PFNZ, BBFAA, Exit);
+  }
+
+  //   if( __sync_fetch_and_add( &pf->incoming_count, -1 ) == 1 )
+  {
+      CGBuilderTy B(BBFAA);
+      Value *IC = GEP(B, PF, PendingFrameBuilder::incoming_count);
+      Value *FAA = B.CreateAtomicRMW(llvm::AtomicRMWInst::Add,
+				     IC, ConstantInt::get(Int32Ty, -1),
+				     AcquireRelease);
+      Value *Cond = B.CreateICmpEQ(FAA, ConstantInt::get(Int32Ty, 1));
+      B.CreateCondBr(Cond, BBAdd, Exit);
+  }
+
+  //      __cilkrts_obj_metadata_add_pending_to_ready_list( __cilkrts_get_tls_worker(), pf );
+  {
+      CGBuilderTy B(BBAdd);
+      Value *W = B.CreateCall(CILKRTS_FUNC(get_tls_worker, CGF));
+      B.CreateCall2(CILKRTS_FUNC(obj_metadata_add_pending_to_ready_list, CGF), W, PF);
+      B.CreateBr(Exit);
+  }
+
+  // }
+  {
+      CGBuilderTy B(Exit);
+      B.CreateRetVoid();
+  }
+
+  Fn->addFnAttr(Attribute::InlineHint);
+}
+#endif
+
 static QualType
 GetDataflowTagType( ASTContext & Ctx, QualType qtype ) {
     CXXRecordDecl * r = qtype.getTypePtr()->getAsCXXRecordDecl();
@@ -2180,7 +2475,7 @@ CodeGenFunction::EmitSpawnCapturedStmt(const CapturedStmt &S,
     CGF.RewriteHelperFunction(Info, F);
 
     // Set inline hint on the multi-function
-    F->addFnAttr(Attribute::AlwaysInline);
+    F->addFnAttr(Attribute::InlineHint); // AlwaysInline);
 
     // Create wrapper helper function
     F = CreateHelperFn(CGF, F);
@@ -2341,6 +2636,7 @@ ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
     // Write the body of the ini_ready_fn() now that we know the arguments
     CompleteIniReadyFn(*this, ArgBeg, ArgEnd);
     CreateIssueFn(*this, ArgBeg, ArgEnd);
+    CreateReleaseFn(*this, ArgBeg, ArgEnd);
 }
 
 static void
@@ -2621,8 +2917,9 @@ namespace {
 ///   __cilk_helper_epilogue(sf);
 class SpawnHelperStackFrameCleanup : public EHScopeStack::Cleanup {
   llvm::Value *SF;
+  bool df;
 public:
-  SpawnHelperStackFrameCleanup(llvm::Value *SF) : SF(SF) { }
+  SpawnHelperStackFrameCleanup(llvm::Value *SF, bool df) : SF(SF), df(df) { }
   void Emit(CodeGenFunction &CGF, Flags F) {
     if (F.isForEHCleanup()) {
       llvm::Value *Exn = CGF.getExceptionFromSlot();
@@ -2637,7 +2934,10 @@ public:
     }
 
     // __cilk_helper_epilogue(sf);
-    CGF.Builder.CreateCall(GetCilkHelperEpilogue(CGF), SF);
+    if(df)
+	CGF.Builder.CreateCall(GetCilkDataflowHelperEpilogue(CGF), SF);
+    else
+	CGF.Builder.CreateCall(GetCilkHelperEpilogue(CGF), SF);
   }
 };
 
@@ -2806,7 +3106,7 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
 
     // Do this only once:
     // Push cleanups associated to this stack frame initialization.
-    CGF.EHStack.pushCleanup<SpawnHelperStackFrameCleanup>(NormalAndEHCleanup, SF);
+    CGF.EHStack.pushCleanup<SpawnHelperStackFrameCleanup>(NormalAndEHCleanup, SF, true);
   } else {
     // Initialize the worker to null. If this worker is still null on exit,
     // then there is no stack frame constructed for spawning and there is no
@@ -2814,7 +3114,7 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
     CGF.Builder.CreateCall(GetCilkResetWorkerFn(CGF), SF);
 
     // Push cleanups associated to this stack frame initialization.
-    CGF.EHStack.pushCleanup<SpawnHelperStackFrameCleanup>(NormalAndEHCleanup, SF);
+    CGF.EHStack.pushCleanup<SpawnHelperStackFrameCleanup>(NormalAndEHCleanup, SF, false);
   }
 }
 
@@ -2849,9 +3149,10 @@ void CGCilkPlusRuntime::EmitCilkHelperPrologue(CodeGenFunction &CGF) {
       BasicBlock *ReloadBB = Info->getReloadBB();
 
       // Terminate SaveBB with conditional branch to terminate
-      Value *Flag = LookupHelperFlag(CGF);
-      Value *Zero = ConstantInt::get(Flag->getType(), 0);
-      Value *Cond = CGF.Builder.CreateICmpNE(Flag, Zero);
+      // Value *Flag = LookupHelperFlag(CGF);
+      // Value *Zero = ConstantInt::get(Flag->getType(), 0);
+      // Value *Cond = CGF.Builder.CreateICmpNE(Flag, Zero);
+      Value *Cond = CGF.Builder.CreateLoad(LookupParentSynced(CGF));
       CGF.Builder.CreateCondBr(Cond, TermBB, ReloadBB);
 
       // Terminate. Exception handling code will be added to this.

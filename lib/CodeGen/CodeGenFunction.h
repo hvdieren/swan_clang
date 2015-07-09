@@ -523,7 +523,7 @@ public:
 				     RecordDecl *RD)
 	: CGCilkSpawnInfo(S, VD, CR_CilkDataflowSpawn), // DataflowState(RD) { }
 	  SavedStateTy(0), SavedState(0), SavedStateArgStart(0), ReloadBB(0),
-	  SaveBB(0), IniReadyFn(0), IssueFn(0) { }
+	  SaveBB(0), IniReadyFn(0), IssueFn(0), ReleaseFn(0) { }
 
       // virtual void EmitBody(CodeGenFunction &CGF, Stmt *S);
     virtual StringRef getHelperName() const { return "__cilk_df_spawn_helper_multi"; }
@@ -547,6 +547,9 @@ public:
 
     void setIssueFn(llvm::Function *IRFn) { IssueFn = IRFn; }
     llvm::Function *getIssueFn() const { return IssueFn; }
+
+    void setReleaseFn(llvm::Function *IRFn) { ReleaseFn = IRFn; }
+    llvm::Function *getReleaseFn() const { return ReleaseFn; }
 
     void setIniReadyFn(llvm::Function *IRFn) { IniReadyFn = IRFn; }
     llvm::Function *getIniReadyFn() const { return IniReadyFn; }
@@ -600,6 +603,7 @@ public:
     llvm::BasicBlock *SaveBB;
     llvm::Function *IniReadyFn;
     llvm::Function *IssueFn;
+    llvm::Function *ReleaseFn;
       RValue RV;
       const CGFunctionInfo * CallInfo;
   };
