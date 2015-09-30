@@ -88,14 +88,6 @@ enum {
                             CILK_FRAME_UNWINDING        | \
                             CILK_FRAME_VERSION_MASK))
 
-enum {
-    OBJ_GROUP_EMPTY     = 1,
-    OBJ_GROUP_READ      = 2,
-    OBJ_GROUP_WRITE     = 4,
-    OBJ_GROUP_COMMUT    = 8,
-    OBJ_GROUP_NOT_WRITE = 31-(int)OBJ_GROUP_WRITE,
-};
-
 typedef uint32_t cilk32_t;
 typedef uint64_t cilk64_t;
 typedef void (*__cilk_abi_f32_t)(void *data, cilk32_t low, cilk32_t high);
@@ -213,13 +205,13 @@ public:
     StructType *Ty = StructType::create(C, "__cilkrts_ready_list");
     cache[&C] = Ty;
     Ty->setBody(
-      TypeBuilder<__cilkrts_pending_frame *, X>::get(C), // dummy
+      TypeBuilder<__cilkrts_pending_frame *,   X>::get(C), // head_next_ready_frame
       TypeBuilder<__cilkrts_pending_frame *, X>::get(C), // tail
       NULL);
     return Ty;
   }
   enum {
-    dummy,
+    head_next_ready_frame,
     tail
   };
 };
@@ -1604,7 +1596,10 @@ static Function *Get__cilkrts_obj_metadata_wakeup_args(CodeGenFunction &CGF) {
 ///
 /// void __cilkrts_move_to_ready_list(__cilkrts_worker *w,
 ///                                   struct __cilkrts_ready_list *rlist) {
-///   ...
+///     if( 0 != rlist->head_next_ready_frame ) {
+///	    w->ready_list.tail->next_ready_frame = rlist->head_next_ready_frame;
+///	    w->ready_list.tail = rlist->tail;
+///     }
 /// }
 static Function *Get__cilkrts_move_to_ready_list(CodeGenFunction &CGF) {
   Function *Fn = 0;
@@ -1616,13 +1611,38 @@ static Function *Get__cilkrts_move_to_ready_list(CodeGenFunction &CGF) {
   // If we get here we need to add the function body
   LLVMContext &Ctx = CGF.getLLVMContext();
 
-  Value * rlist = Fn->arg_begin();
-  Value * meta = ++Fn->arg_begin();
+  Value *W = Fn->arg_begin();
+  Value *RL = ++Fn->arg_begin();
 
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+  BasicBlock *NotEmpty = BasicBlock::Create(Ctx, "not_empty", Fn);
+  BasicBlock *Return = BasicBlock::Create(Ctx, "return", Fn);
 
-  CGBuilderTy B(Entry);
-  B.CreateRetVoid();
+  Value *HNRF;
+
+  {
+      CGBuilderTy B(Entry);
+      HNRF = LoadField(B, RL, ReadyListBuilder::head_next_ready_frame);
+      Value *Zero = ConstantPointerNull::get(
+	  cast<llvm::PointerType>(HNRF->getType()));
+      Value *Comp = B.CreateICmpNE(HNRF, Zero);
+      B.CreateCondBr(Comp, NotEmpty, Return);
+  }
+
+  {
+      CGBuilderTy B(NotEmpty);
+      Value *WRL = GEP(B, W, WorkerBuilder::ready_list);
+      Value *WTail = LoadField(B, WRL, ReadyListBuilder::tail);
+      StoreField(B, HNRF, WTail, ReadyListBuilder::head_next_ready_frame);
+      Value *Tail = LoadField(B, RL, ReadyListBuilder::tail);
+      StoreField(B, Tail, WRL, ReadyListBuilder::tail);
+      B.CreateRetVoid();
+  }
+
+  {
+      CGBuilderTy B(Return);
+      B.CreateRetVoid();
+  }
 
   Fn->addFnAttr(Attribute::InlineHint);
  
@@ -1689,7 +1709,6 @@ Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
     BasicBlock *NotReady = BasicBlock::Create(Ctx, "not_ready", Fn);
     BasicBlock *Unlock = BasicBlock::Create(Ctx, "unlock", Fn);
 
-    llvm::Type * Int32Ty = llvm::Type::getInt32Ty(Ctx);
     llvm::Type * Int64Ty = llvm::Type::getInt64Ty(Ctx);
 
     Value * PushG;
@@ -1709,9 +1728,9 @@ Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
 
 	// bool joins = youngest.match_group( g );
 	Value *G = LoadField(B, OBJ, ObjMetadataBuilder::youngest_group);
-	Value *Empty = ConstantInt::get(GRP->getType(), OBJ_GROUP_EMPTY);
+	Value *Empty = ConstantInt::get(GRP->getType(), CILK_OBJ_GROUP_EMPTY);
 	Value *GrpOrEmpty = B.CreateOr(GRP, Empty);
-	Value *NotWrite = ConstantInt::get(GRP->getType(), OBJ_GROUP_NOT_WRITE);
+	Value *NotWrite = ConstantInt::get(GRP->getType(), CILK_OBJ_GROUP_NOT_WRITE);
 	Value *AndNotWrite = B.CreateAnd(GrpOrEmpty, NotWrite);
 	Value *AndG = B.CreateAnd(G, AndNotWrite);
 	Value *Zero = ConstantInt::get(GRP->getType(), 0);
@@ -1823,7 +1842,7 @@ Get__cilkrts_obj_metadata_add_task_read(CodeGenFunction &CGF) {
   CGBuilderTy B(Entry);
 
   llvm::Type * Int32Ty = llvm::Type::getInt32Ty(Ctx);
-  Value *G = ConstantInt::get(Int32Ty, OBJ_GROUP_READ);
+  Value *G = ConstantInt::get(Int32Ty, CILK_OBJ_GROUP_READ);
   B.CreateCall4(CILKRTS_FUNC(obj_metadata_add_task, CGF),
 		PF, OBJ, TLN, G);
   B.CreateRetVoid();
@@ -1851,7 +1870,7 @@ Get__cilkrts_obj_metadata_add_task_write(CodeGenFunction &CGF) {
   CGBuilderTy B(Entry);
 
   llvm::Type * Int32Ty = llvm::Type::getInt32Ty(Ctx);
-  Value *G = ConstantInt::get(Int32Ty, OBJ_GROUP_WRITE);
+  Value *G = ConstantInt::get(Int32Ty, CILK_OBJ_GROUP_WRITE);
   B.CreateCall4(CILKRTS_FUNC(obj_metadata_add_task, CGF),
 		PF, OBJ, TLN, G);
   B.CreateRetVoid();
@@ -1880,12 +1899,37 @@ IsDataflowType(const clang::Type * type) {
     return false;
 }
 
+static int
+GetDataflowKind(const clang::Type * type) {
+    if( type->isRecordType() ) {
+	if( const CXXRecordDecl * rdecl = type->getAsCXXRecordDecl() ) {
+	    // Does any of the methods of the struct/union/class have a
+	    // signature method name?
+	    for( CXXRecordDecl::method_iterator
+		     I=rdecl->method_begin(),
+		     E=rdecl->method_end(); I != E; ++I ) {
+		FunctionDecl * m = *I;
+		if( IdentifierInfo * id = m->getIdentifier() ) {
+		    if( id->isStr( "__Cilk_is_dataflow_indep_type" ) )
+			return CILK_OBJ_GROUP_READ;
+		    else if( id->isStr( "__Cilk_is_dataflow_inoutdep_type" ) )
+			return CILK_OBJ_GROUP_WRITE;
+		    else if( id->isStr( "__Cilk_is_dataflow_outdep_type" ) )
+			return CILK_OBJ_GROUP_WRITE;
+		    else if( id->isStr( "__Cilk_is_dataflow_cinoutdep_type" ) )
+			return CILK_OBJ_GROUP_COMMUT;
+		}
+	    }
+	}
+    }
+    return CILK_OBJ_GROUP_EMPTY;
+}
+
 static llvm::Function *
 CreateCallFn(CodeGenFunction &CGF, llvm::Function * HelperF) {
     llvm::Module &Module = CGF.CGM.getModule();
     LLVMContext &Ctx = CGF.getLLVMContext();
     llvm::Type * Int1Ty = llvm::Type::getInt1Ty(Ctx);
-    llvm::Type * Int32Ty = llvm::Type::getInt32Ty(Ctx);
 
     // Create CallFn
     llvm::FunctionType *FTy
@@ -1931,7 +1975,6 @@ CreateHelperFn(CodeGenFunction &CGF, llvm::Function * MultiF) {
     llvm::Module &Module = CGF.CGM.getModule();
     LLVMContext &Ctx = CGF.getLLVMContext();
     llvm::Type * Int1Ty = llvm::Type::getInt1Ty(Ctx);
-    llvm::Type * Int32Ty = llvm::Type::getInt32Ty(Ctx);
 
     // Create HelperFn
     unsigned NumArgs = std::distance(MultiF->arg_begin(), MultiF->arg_end());
@@ -2047,7 +2090,7 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
 				->arg_begin()->getType());
 	  Value *Group
 	      = ConstantInt::get(llvm::Type::getInt32Ty(Ctx),
-				 CILK_OBJ_GROUP_WRITE); // TODO - READ?
+				 GetDataflowKind(type));
 	  Value *IReady
 	      = B.CreateCall2(CILKRTS_FUNC(obj_metadata_ini_ready, CGF), Meta, Group);
 
@@ -2175,11 +2218,18 @@ CreateIssueFn(CodeGenFunction &CGF,
 	      // struct.__cilkrts_obj_metadata != __cilkrts_obj_metadata
 	      Value *CMeta = B.CreatePointerCast(Meta, (++WrFn->arg_begin())->getType());
 	      Value *Tag = GEP(B, Tags, i);
-	      if( CILK_OBJ_GROUP_WRITE == CILK_OBJ_GROUP_WRITE ) // TODO
-		  B.CreateCall3(WrFn, PF, CMeta, Tag);
-	      else
+	      switch( GetDataflowKind( type ) ) {
+	      case CILK_OBJ_GROUP_READ:
 		  B.CreateCall3(CILKRTS_FUNC(obj_metadata_add_task_read, CGF),
 				PF, CMeta, Tag);
+		  break;
+	      case CILK_OBJ_GROUP_WRITE:
+		  B.CreateCall3(WrFn, PF, CMeta, Tag);
+		  break;
+	      case CILK_OBJ_GROUP_COMMUT:
+	      default:
+		  assert(0 && "Erroneous dataflow kind");
+	      }
 	      ++i;
 	  }
       }
@@ -2240,15 +2290,12 @@ CreateReleaseFn(CodeGenFunction &CGF,
 
   Info->setReleaseFn(Fn);
 
-  llvm::Type *Int32Ty = llvm::Type::getInt32Ty(Ctx);
-
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
 
   CGBuilderTy B(Entry);
 
   // Create empty list
-  llvm::AllocaInst *RList = B.CreateAlloca(
-      TypeBuilder<__cilkrts_ready_list, false>::get(Ctx));
+  llvm::AllocaInst *RList = B.CreateAlloca(ReadyListBuilder::get(Ctx));
 
   // Recover the worker
   Value *W = B.CreateCall(CILKRTS_FUNC(get_tls_worker, CGF));
@@ -2256,8 +2303,12 @@ CreateReleaseFn(CodeGenFunction &CGF,
   // Initialize ready list as an empty list
   Value *Null = ConstantPointerNull::get(
       TypeBuilder<__cilkrts_pending_frame *, false>::get(Ctx));
-  StoreField(B, Null, RList, ReadyListBuilder::dummy);
-  StoreField(B, Null, RList, ReadyListBuilder::tail);
+  StoreField(B, Null, RList, ReadyListBuilder::head_next_ready_frame);
+  Value *HNRFAddr = GEP(B, RList, ReadyListBuilder::head_next_ready_frame);
+  Value *HNRFCast
+      = B.CreateBitCast(HNRFAddr,
+			TypeBuilder<__cilkrts_pending_frame *, false>::get(Ctx));
+  StoreField(B, HNRFCast, RList, ReadyListBuilder::tail);
 
   // Get the args and tags
   Value *SVoid = Fn->arg_begin();
@@ -2265,23 +2316,23 @@ CreateReleaseFn(CodeGenFunction &CGF,
       = B.CreateBitCast(SVoid,
 			llvm::PointerType::getUnqual(Info->getSavedStateTy()));
   Value *Args = GEP(B, S, 0);
-  Value *Tags = GEP(B, S, 1);
+  // Value *Tags = GEP(B, S, 1);
 
   // Call __cilkrts_obj_metadata_wakeup_args for every dataflow argument
   unsigned i=0;
   for( CallExpr::const_arg_iterator I=ArgBeg, E=ArgEnd; I != E; ++I ) {
       const clang::Type * type = I->getType().getTypePtr();
       if( IsDataflowType( type ) ) {
-	  Function * WrFn = CILKRTS_FUNC(obj_metadata_wakeup_args, CGF);
+	  Function * WakeFn = CILKRTS_FUNC(obj_metadata_wakeup_args, CGF);
 	  Value *Var = LoadField(B, GEP(B, Args, i), 0);
 	  Value *Meta = GEP(B, Var, ObjVersionBuilder::meta);
 	  // struct.__cilkrts_obj_metadata != __cilkrts_obj_metadata
-	  Value *CMeta = B.CreatePointerCast(Meta, (++WrFn->arg_begin())->getType());
-	  Value *Tag = GEP(B, Tags, i);
+	  Value *CMeta = B.CreatePointerCast(Meta, (++WakeFn->arg_begin())->getType());
+	  // Value *Tag = GEP(B, Tags, i);
 	  // TODO: This call could be slightly more efficient if we knew it was
 	  // read or write because with write you know that the generation
 	  // (should) drop empty.
-	  B.CreateCall2(WrFn, RList, CMeta);
+	  B.CreateCall2(WakeFn, RList, CMeta);
 	  ++i;
       }
   }
@@ -2804,7 +2855,7 @@ void
 CodeGenFunction::
 RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
 		      llvm::Function *HelperFn) {
-    const CGFunctionInfo &CallInfo = *Info->getCallInfo();
+    // const CGFunctionInfo &CallInfo = *Info->getCallInfo();
     RValue RV = Info->getRValue();
 
     llvm::errs() << " *** RewriteHelperFunction ***\n";
@@ -2841,7 +2892,7 @@ RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
     Builder.SetInsertPoint(ReloadBB);
     */
 
-    BasicBlock * ReloadBB = Info->getReloadBB();
+    // BasicBlock * ReloadBB = Info->getReloadBB();
     BasicBlock * SaveBB = Info->getSaveBB();
 
     // Erase terminator
@@ -2869,7 +2920,6 @@ RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
 	B2.CreateConstInBoundsGEP2_32(SavedState2, 0, 0);
 
     // Store and reload every call argument
-    llvm::Type *Int32Ty = llvm::Type::getInt32Ty(Ctx);
     for( unsigned i=0, e=NumArgs; i != e; ++i ) {
 	llvm::Value * Arg = RVInst->getOperand(i);
 	if( isa<Instruction>(Arg) || isa<Argument>(Arg) ) {
