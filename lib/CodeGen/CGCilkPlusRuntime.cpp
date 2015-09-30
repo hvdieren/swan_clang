@@ -88,6 +88,14 @@ enum {
                             CILK_FRAME_UNWINDING        | \
                             CILK_FRAME_VERSION_MASK))
 
+enum {
+    OBJ_GROUP_EMPTY     = 1,
+    OBJ_GROUP_READ      = 2,
+    OBJ_GROUP_WRITE     = 4,
+    OBJ_GROUP_COMMUT    = 8,
+    OBJ_GROUP_NOT_WRITE = 31-(int)OBJ_GROUP_WRITE,
+};
+
 typedef uint32_t cilk32_t;
 typedef uint64_t cilk64_t;
 typedef void (*__cilk_abi_f32_t)(void *data, cilk32_t low, cilk32_t high);
@@ -125,6 +133,10 @@ typedef void (__cilkrts_obj_metadata_add_task_read)(__cilkrts_pending_frame *,
 typedef void (__cilkrts_obj_metadata_add_task_write)(__cilkrts_pending_frame *,
 						     __cilkrts_obj_metadata *,
 						     __cilkrts_task_list_node *);
+typedef void (__cilkrts_obj_metadata_add_task)(__cilkrts_pending_frame *,
+					       __cilkrts_obj_metadata *,
+					       __cilkrts_task_list_node *,
+					       int group);
 typedef void (__cilkrts_obj_metadata_add_pending_to_ready_list)(
     __cilkrts_worker *, __cilkrts_pending_frame *);
 typedef void (__cilkrts_move_to_ready_list)(
@@ -151,8 +163,6 @@ DEFAULT_GET_CILKRTS_FUNC(leave_frame)
 DEFAULT_GET_CILKRTS_FUNC(get_tls_worker)
 DEFAULT_GET_CILKRTS_FUNC(bind_thread_1)
 DEFAULT_GET_CILKRTS_FUNC(pending_frame_create)
-DEFAULT_GET_CILKRTS_FUNC(obj_metadata_add_task_read)
-DEFAULT_GET_CILKRTS_FUNC(obj_metadata_add_task_write)
 DEFAULT_GET_CILKRTS_FUNC(detach_pending)
 
 typedef std::map<llvm::LLVMContext*, llvm::StructType*> TypeBuilderCache;
@@ -437,7 +447,7 @@ public:
     TypeBuilderCache::iterator I = cache.find(&C);
     if (I != cache.end())
       return I->second;
-    StructType *Ty = StructType::create(C, "__cilkrts_obj_metadata");
+    StructType *Ty = StructType::create(C, "__cilkrts_obj_version");
     cache[&C] = Ty;
     Ty->setBody(
 	TypeBuilder<__cilkrts_obj_metadata, X>::get(C), // meta
@@ -487,6 +497,7 @@ typedef llvm::TypeBuilder<__cilkrts_versioned, false> VersionedBuilder;
 typedef llvm::TypeBuilder<__cilkrts_pending_frame, false> PendingFrameBuilder;
 typedef llvm::TypeBuilder<__cilkrts_ready_list, false> ReadyListBuilder;
 typedef llvm::TypeBuilder<__cilkrts_task_list_node, false> TaskListNodeBuilder;
+typedef llvm::TypeBuilder<__cilkrts_task_list, false> TaskListBuilder;
 
 static Value *GEP(CGBuilderTy &B, Value *Base, int field) {
   return B.CreateConstInBoundsGEP2_32(Base, 0, field);
@@ -1658,6 +1669,197 @@ Get__cilkrts_obj_metadata_add_pending_to_ready_list(CodeGenFunction &CGF) {
   return Fn;
 }
 
+static Function *
+Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
+  Function *Fn = 0;
+
+  if (GetOrCreateFunction<__cilkrts_obj_metadata_add_task>(
+	  "__cilkrts_obj_metadata_add_task", CGF, Fn))
+    return Fn;
+
+    LLVMContext &Ctx = CGF.getLLVMContext();
+
+    Function::arg_iterator I = Fn->arg_begin();
+    Value *PF = I;     // pending_frame
+    Value *OBJ = ++I;  // obj_metadata
+    Value *TLN = ++I;  // task_list_node
+    Value *GRP = ++I;    // group
+
+    BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+    BasicBlock *NotReady = BasicBlock::Create(Ctx, "not_ready", Fn);
+    BasicBlock *Unlock = BasicBlock::Create(Ctx, "unlock", Fn);
+
+    llvm::Type * Int32Ty = llvm::Type::getInt32Ty(Ctx);
+    llvm::Type * Int64Ty = llvm::Type::getInt64Ty(Ctx);
+
+    Value * PushG;
+
+    {
+	CGBuilderTy B(Entry);
+
+	// tags->set_task_and_last( t, false );
+	// a.k.a.:
+	// st_task_and_last
+	//      = reinterpret_cast<uintptr_t>( task ) | uintptr_t(last);
+	StoreField(B, PF, TLN, TaskListNodeBuilder::st_task);
+
+	// lock();
+	Value *Lock = GEP(B, OBJ, ObjMetadataBuilder::mutex);
+	// Call(spin_mutex_lock, Lock);
+
+	// bool joins = youngest.match_group( g );
+	Value *G = LoadField(B, OBJ, ObjMetadataBuilder::youngest_group);
+	Value *Empty = ConstantInt::get(GRP->getType(), OBJ_GROUP_EMPTY);
+	Value *GrpOrEmpty = B.CreateOr(GRP, Empty);
+	Value *NotWrite = ConstantInt::get(GRP->getType(), OBJ_GROUP_NOT_WRITE);
+	Value *AndNotWrite = B.CreateAnd(GrpOrEmpty, NotWrite);
+	Value *AndG = B.CreateAnd(G, AndNotWrite);
+	Value *Zero = ConstantInt::get(GRP->getType(), 0);
+	Value *Joins = B.CreateICmpNE(AndG, Zero);
+
+	// bool pushg = !youngest.push_group( g );
+	Value *GrpAndNotWrite = B.CreateAnd(GRP, NotWrite);
+	Value *AndG2 = B.CreateAnd(G, GrpAndNotWrite);
+	PushG = B.CreateICmpEQ(AndG2, Zero);
+
+	// bool ready = joins & ( num_gens <= 1 );
+	Value *NumGens = LoadField(B, OBJ, ObjMetadataBuilder::num_gens);
+	Value *One = ConstantInt::get(NumGens->getType(), 1);
+	Value *ActiveGen = B.CreateICmpULE(NumGens, One);
+	Value *Ready = B.CreateAnd(Joins, ActiveGen);
+
+	// push_generation( pushg );
+	// a.k.a.: num_gens += pushg;
+	Value *PushGWide = B.CreateZExt(PushG, NumGens->getType());
+	Value *NumGensInc = B.CreateAdd(NumGens, PushGWide);
+	StoreField(B, NumGensInc, OBJ, ObjMetadataBuilder::num_gens);
+
+	// oldest.num_tasks += ready;
+	Value *NumTasks = LoadField(B, OBJ, ObjMetadataBuilder::oldest_num_tasks);
+	Value *NTOne = ConstantInt::get(NumTasks->getType(), 1);
+	Value *NumTasksInc = B.CreateAdd(NumTasks, NTOne);
+
+	StoreField(B, NumTasksInc, OBJ, ObjMetadataBuilder::oldest_num_tasks);
+
+	// youngest.open_group( g ); // redundant if joins == true
+	// a.k.a.: youngest.g = g;
+	StoreField(B, GRP, OBJ, ObjMetadataBuilder::youngest_group);
+
+	// if( !ready ) {
+	B.CreateCondBr(Ready, Unlock, NotReady);
+    }
+
+    {
+	CGBuilderTy B(NotReady);
+
+	// __sync_fetch_and_add( &t->incoming_count, 1 );
+	Value *InCnt = GEP(B, PF, PendingFrameBuilder::incoming_count);
+	llvm::PointerType *PTy = cast<llvm::PointerType>(InCnt->getType());
+	Value *InCnt1 = ConstantInt::get(PTy->getContainedType(0), 1);
+	B.CreateAtomicRMW(llvm::AtomicRMWInst::Add, InCnt, InCnt1,
+			  llvm::SequentiallyConsistent);
+
+	// __cilkrts_task_list_node * old_tail = tasks.tail;
+	Value *Tasks = GEP(B, OBJ, ObjMetadataBuilder::tasks);
+	Value *OldTail = LoadField(B, Tasks, TaskListBuilder::tail);
+
+	// tasks.tail->it_next = tags;
+	StoreField(B, TLN, OldTail, TaskListNodeBuilder::it_next);
+
+	// tasks.tail = tags;
+	StoreField(B, TLN, Tasks, TaskListBuilder::tail);
+
+	// old_tail->set_last_in_generation( pushg );
+	// a.k.a.:
+	// st_task_and_last =
+	    // ( st_task_and_last & ~uintptr_t(1) ) | uintptr_t(v);
+	Value *LastTask = LoadField(B, OldTail, TaskListNodeBuilder::st_task);
+	Value *CastLT = B.CreatePtrToInt(LastTask, Int64Ty);
+	Value *One = ConstantInt::get(Int64Ty, (unsigned long long)1);
+	Value *NotOne = B.CreateNot(One);
+	Value *AndNotOne = B.CreateAnd(CastLT, NotOne);
+	Value *PushG64 = B.CreateZExt(PushG, Int64Ty);
+	Value *OrPushG = B.CreateOr(AndNotOne, PushG64);
+	Value *UpdatedOldTail = B.CreateIntToPtr(OrPushG, LastTask->getType());
+	StoreField(B, UpdatedOldTail, OldTail, TaskListNodeBuilder::st_task);
+	B.CreateBr(Unlock);
+    }
+
+    // assert( num_gens > 0 );
+
+    {
+	CGBuilderTy B(Unlock);
+
+	// unlock();
+	Value *Lock = GEP(B, OBJ, ObjMetadataBuilder::mutex);
+	// Call(spin_mutex_unlock, Lock);
+
+	// TODO: return true if ready after all (?)
+	B.CreateRetVoid();
+    }
+
+    Fn->addFnAttr(Attribute::InlineHint);
+
+    return Fn;
+}
+
+static Function *
+Get__cilkrts_obj_metadata_add_task_read(CodeGenFunction &CGF) {
+  Function *Fn = 0;
+
+  if (GetOrCreateFunction<__cilkrts_obj_metadata_add_task_read>(
+	  "__cilkrts_obj_metadata_add_task_read", CGF, Fn))
+    return Fn;
+
+  // If we get here we need to add the function body
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  Function::arg_iterator I = Fn->arg_begin();
+  Value *PF = I;     // pending_frame
+  Value *OBJ = ++I;  // obj_metadata
+  Value *TLN = ++I;  // task_list_node
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+  CGBuilderTy B(Entry);
+
+  llvm::Type * Int32Ty = llvm::Type::getInt32Ty(Ctx);
+  Value *G = ConstantInt::get(Int32Ty, OBJ_GROUP_READ);
+  B.CreateCall4(CILKRTS_FUNC(obj_metadata_add_task, CGF),
+		PF, OBJ, TLN, G);
+  B.CreateRetVoid();
+
+  return Fn;
+}
+
+static Function *
+Get__cilkrts_obj_metadata_add_task_write(CodeGenFunction &CGF) {
+  Function *Fn = 0;
+
+  if (GetOrCreateFunction<__cilkrts_obj_metadata_add_task_write>(
+	  "__cilkrts_obj_metadata_add_task_write", CGF, Fn))
+    return Fn;
+
+  // If we get here we need to add the function body
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  Function::arg_iterator I = Fn->arg_begin();
+  Value *PF = I;     // pending_frame
+  Value *OBJ = ++I;  // obj_metadata
+  Value *TLN = ++I;  // task_list_node
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+  CGBuilderTy B(Entry);
+
+  llvm::Type * Int32Ty = llvm::Type::getInt32Ty(Ctx);
+  Value *G = ConstantInt::get(Int32Ty, OBJ_GROUP_WRITE);
+  B.CreateCall4(CILKRTS_FUNC(obj_metadata_add_task, CGF),
+		PF, OBJ, TLN, G);
+  B.CreateRetVoid();
+
+  return Fn;
+}
+
+
 static bool
 IsDataflowType(const clang::Type * type) {
     if( type->isRecordType() ) {
@@ -1791,7 +1993,9 @@ CreateIniReadyFn(CodeGenFunction &CGF) {
   llvm::FunctionType *FTy = llvm::FunctionType::get(
       TypeBuilder<__cilkrts_pending_frame *, false>::get(Ctx), params, false);
   llvm::Function * Fn
-      = Function::Create(FTy, llvm::GlobalValue::InternalLinkage,
+      = Function::Create(FTy,
+			 llvm::GlobalValue::InternalLinkage,
+			 // llvm::GlobalValue::ExternalLinkage,
 			 FnName, &CGF.CGM.getModule());
 
   Info->setIniReadyFn(Fn);
@@ -1817,12 +2021,10 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
 
   // Key basic blocks
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
-  BasicBlock *Unsynced = BasicBlock::Create(Ctx, "unsynced", Fn);
-  BasicBlock *bb_ready = 0; // BasicBlock::Create(Ctx, "ready", Fn);
+  BasicBlock *bb_ready = BasicBlock::Create(Ctx, "check_arg0", Fn);
   BasicBlock *bb_not_ready = BasicBlock::Create(Ctx, "not_ready", Fn);
+  BasicBlock *Unsynced = bb_ready;
 
-  // Start off with the ready checks
-  CGBuilderTy B(Unsynced);
 
   // Now we need to know which arguments are dataflow and emit a call to
   // __cilkrts_obj_metadata_ini_ready for them.
@@ -1830,6 +2032,8 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
   for( CallExpr::const_arg_iterator I=ArgBeg, E=ArgEnd; I != E; ++I, ++i ) {
       const clang::Type * type = I->getType().getTypePtr();
       if( IsDataflowType( type ) ) {
+	  CGBuilderTy B(bb_ready);
+
 	  // Emit a ready check and move the insertion point to the basic block
 	  // on the ready path, creating a new ready block.
 	  // EmitCilkHelperIniReadyArg(CGF, bb_ready, bb_not_ready, Args[i]);
@@ -1849,16 +2053,17 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
 
 	  Value *Cond = B.CreateICmpNE(IReady,
 				       ConstantInt::get(IReady->getType(), 0));
-	  bb_ready = BasicBlock::Create(Ctx, "ready", Fn, bb_not_ready);
+	  bb_ready = BasicBlock::Create(Ctx, "check_arg1", Fn, bb_not_ready);
 	  B.CreateCondBr(Cond, bb_ready, bb_not_ready);
 
-	  B.SetInsertPoint(bb_ready);
+	  // B.SetInsertPoint(bb_ready);
       }
   }
 
   // Create the case where arguments are initially not ready: pending frame
-  B.SetInsertPoint(bb_not_ready);
   {
+      CGBuilderTy B(bb_not_ready);
+
       // Get size of SavedStateType (args_tags)
       llvm::StructType *State = Info->getSavedStateTy();
       // Get structure size
@@ -1890,38 +2095,34 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
   }
 
   // Create the case where arguments are initially ready: stack frame
-  if( !bb_ready )
-      bb_ready = BasicBlock::Create(Ctx, "ready", Fn);
-  B.SetInsertPoint(bb_ready);
+  {
+      CGBuilderTy B(bb_ready);
 
-  Value *ZF = ConstantPointerNull::get(
-      llvm::PointerType::getUnqual(PendingFrameBuilder::get(Ctx)));
-  B.CreateRet(ZF);
+      Value *ZF = ConstantPointerNull::get(
+	  llvm::PointerType::getUnqual(PendingFrameBuilder::get(Ctx)));
+      B.CreateRet(ZF);
+  }
 
   // Create the code that checks for an unsynced frame
-  B.SetInsertPoint(Entry);
+  // B.SetInsertPoint(Entry);
+  {
+      CGBuilderTy B(Entry);
+      // SKIP the check of the worker because this is already done in the
+      // calling function and the condition was false.
 
-#if 0
-  // SKIP the check of the worker because this is already done in the
-  // calling function and the condition was false.
+      // First, insert a check to see if the parent's stack frame is SYNCHED.
+      // If SYNCHED, then no need to track dataflow dependences.
+      Value *Worker = B.CreateCall(CILKRTS_FUNC(get_tls_worker, CGF));
+      Value *CurSF = LoadField(B, Worker, WorkerBuilder::current_stack_frame);
+      Value *Flags = LoadField(B, CurSF, StackFrameBuilder::flags);
+      Value *SFlag = B.CreateAnd(Flags,
+				 ConstantInt::get(Flags->getType(),
+						  CILK_FRAME_UNSYNCHED));
+      Value *Zero = Constant::getNullValue(SFlag->getType());
 
-  // First, insert a check to see if the parent's stack frame is SYNCHED.
-  // If SYNCHED, then no need to track dataflow dependences.
-  Value *Worker = B.CreateCall(CILKRTS_FUNC(get_tls_worker, CGF));
-
-  // Poll if parent is synced
-  Value *CurSF = LoadField(B, Worker, WorkerBuilder::current_stack_frame);
-  Value *Flags = LoadField(B, CurSF, StackFrameBuilder::flags);
-  Value *SFlag = B.CreateAnd(Flags,
-			     ConstantInt::get(Flags->getType(),
-					      CILK_FRAME_UNSYNCHED));
-  Value *Zero = Constant::getNullValue(SFlag->getType());
-
-  Value *ParentUnsynced = B.CreateICmpEQ(SFlag, Zero);
-  B.CreateCondBr(ParentUnsynced, bb_ready, Unsynced);
-#else
-  B.CreateBr(Unsynced);
-#endif
+      Value *ParentUnsynced = B.CreateICmpEQ(SFlag, Zero);
+      B.CreateCondBr(ParentUnsynced, bb_ready, Unsynced);
+  }
 }
 
 static void
@@ -2095,79 +2296,6 @@ CreateReleaseFn(CodeGenFunction &CGF,
 
   return Fn;
 }
-
-
-#if 0
-{
-  BasicBlock *BBFAA = BasicBlock::Create(Ctx, "bbfaa", Fn);
-  BasicBlock *BBAdd = BasicBlock::Create(Ctx, "bbadd", Fn);
-  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
-  Value *PF, *S, *Args, *Tags;
-
-  {
-      CGBuilderTy B(Entry);
-
-      PF = Fn->arg_begin();
-      Value *SVoid = ++Fn->arg_begin();
-      S = B.CreateBitCast(SVoid, llvm::PointerType::getUnqual(Info->getSavedStateTy()));
-      Args = GEP(B, S, 0);
-      Tags = GEP(B, S, 1);
-
-      // Call __cilkrts_obj_metadata_add_task for every dataflow argument
-      unsigned i=0;
-      for( CallExpr::const_arg_iterator I=ArgBeg, E=ArgEnd; I != E; ++I ) {
-	  const clang::Type * type = I->getType().getTypePtr();
-	  if( IsDataflowType( type ) ) {
-	      Function * WrFn = CILKRTS_FUNC(obj_metadata_add_task_write, CGF);
-	      Value *Var = LoadField(B, GEP(B, Args, i), 0);
-	      Value *Meta = GEP(B, Var, ObjVersionBuilder::meta);
-	      // struct.__cilkrts_obj_metadata != __cilkrts_obj_metadata
-	      Value *CMeta = B.CreatePointerCast(Meta, (++WrFn->arg_begin())->getType());
-	      Value *Tag = GEP(B, Tags, i);
-	      if( CILK_OBJ_GROUP_WRITE == CILK_OBJ_GROUP_WRITE ) // TODO
-		  B.CreateCall3(WrFn, PF, CMeta, Tag);
-	      else
-		  B.CreateCall3(CILKRTS_FUNC(obj_metadata_add_task_read, CGF),
-				PF, CMeta, Tag);
-	      ++i;
-	  }
-      }
-
-      // if( pf ) { // Issue late starts with incoming on 0, no need to subtract
-
-      Value *PFNZ = B.CreateICmpNE(PF, ConstantPointerNull::get(
-				       cast<llvm::PointerType>(PF->getType())));
-      B.CreateCondBr(PFNZ, BBFAA, Exit);
-  }
-
-  //   if( __sync_fetch_and_add( &pf->incoming_count, -1 ) == 1 )
-  {
-      CGBuilderTy B(BBFAA);
-      Value *IC = GEP(B, PF, PendingFrameBuilder::incoming_count);
-      Value *FAA = B.CreateAtomicRMW(llvm::AtomicRMWInst::Add,
-				     IC, ConstantInt::get(Int32Ty, -1),
-				     AcquireRelease);
-      Value *Cond = B.CreateICmpEQ(FAA, ConstantInt::get(Int32Ty, 1));
-      B.CreateCondBr(Cond, BBAdd, Exit);
-  }
-
-  //      __cilkrts_obj_metadata_add_pending_to_ready_list( __cilkrts_get_tls_worker(), pf );
-  {
-      CGBuilderTy B(BBAdd);
-      Value *W = B.CreateCall(CILKRTS_FUNC(get_tls_worker, CGF));
-      B.CreateCall2(CILKRTS_FUNC(obj_metadata_add_pending_to_ready_list, CGF), W, PF);
-      B.CreateBr(Exit);
-  }
-
-  // }
-  {
-      CGBuilderTy B(Exit);
-      B.CreateRetVoid();
-  }
-
-  Fn->addFnAttr(Attribute::InlineHint);
-}
-#endif
 
 static QualType
 GetDataflowTagType( ASTContext & Ctx, QualType qtype ) {
@@ -2592,7 +2720,7 @@ ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
 				    "", &*AllocaStart);
     new StoreInst(SSVoid, SavedState, &*AllocaStart);
 
-    Info->setSavedState(SavedStateTy, SavedState, SavedStateArgStart );
+    Info->setSavedState(SavedStateTy, SavedState, SavedStateArgStart);
 
     // Replace each of the alloc's with a GEP from the saved state
     llvm::Value * idx[2];
@@ -2744,161 +2872,16 @@ RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
     llvm::Type *Int32Ty = llvm::Type::getInt32Ty(Ctx);
     for( unsigned i=0, e=NumArgs; i != e; ++i ) {
 	llvm::Value * Arg = RVInst->getOperand(i);
-	llvm::Value *GEP1 =
-	    B1.CreateConstInBoundsGEP2_32(ArgsSave, 0, SavedStateArgStart+i);
-	B1.CreateStore(Arg, GEP1);
+	if( isa<Instruction>(Arg) || isa<Argument>(Arg) ) {
+	    llvm::Value *GEP1 =
+		B1.CreateConstInBoundsGEP2_32(ArgsSave, 0, SavedStateArgStart+i);
+	    B1.CreateStore(Arg, GEP1);
 
-	llvm::Value *RL2 = LoadField(B2, ArgsReload, SavedStateArgStart+i);
-	// RVInst->setOperand(i, RL2);
-	ReplaceAllReachableUses(ReachableBBs, Arg, RL2);
-    }
-}
-
-#if 0
-{
-    // On the spawn_helper (ready args) path, do some extra work
-
-    // Check for readiness and branch out if not ready
-    llvm::Value *PF = LookupPendingFrame(*this);
-
-    BasicBlock *PFDetach = BasicBlock::Create(Ctx, "__cilk_pf_detach", CurFn);
-    BasicBlock *SFDetach = BasicBlock::Create(Ctx, "__cilk_sf_detach", CurFn);
-    BasicBlock *SFCreate = BasicBlock::Create(Ctx, "__cilk_sf_create", CurFn);
-
-    // Fixup the paths out of the early check on the "flag" argument
-    if( BasicBlock *ReadyCheckBB=Info->getReloadBB() ) {
-	CGBuilderTy B(&CurFn->getEntryBlock());
-
-	// Check flag to see if we jump to reload_bb immediately or not
-	llvm::Function::arg_iterator Arg = CurFn->arg_begin();
-	std::advance(Arg, 3);
-	llvm::Value *Flag = Arg;
-
-	llvm::Value *DoCall
-	    = B.CreateICmpNE(Flag, ConstantInt::get(Flag->getType(), 0));
-	B.CreateCondBr(DoCall, ReloadBB, ReadyCheckBB);
-
-	{
-	    CGBuilderTy B(SaveBB);
-
-	    llvm::Value *PFZero
-		= B.CreateICmpNE(PF, ConstantPointerNull::get(
-				     cast<llvm::PointerType>(PF->getType())));
-	    B.CreateCondBr(PFZero, PFDetach, SFCreate);
-	}
-    }
-    Info->setReloadBB(ReloadBB);
-
-    {
-	// Detach stack frame and continue on to reload
-	CGBuilderTy B(SFDetach);
-
-	// __cilkrts_detach(sf);
-	B.CreateCall(CILKRTS_FUNC(detach, *this), SF);
-	B.CreateBr(ReloadBB);
-    }
-
-    {
-	// Detach of pending frame and return
-	CGBuilderTy B(PFDetach);
-
-	// pf->call_fn = &spawn_helper_call_fn;
-	Value *CallFn = CreateCallFn(*this, Info->getSavedStateTy(),
-				     HelperFn, CurFn);
-	Value *PFVoid = B.CreateBitCast(PF, llvm::PointerType::getUnqual(
-					    llvm:Type::getVoidTy(Ctx)));
-	StoreField(B, CallFn, PFVoid, PendingFrameBuilder::call_fn);
-
-	// spawn_helper_issue_fn(pf,pf->args_tags);
-	Value *IssueFn
-	    = 0; // GenerateDataflowIssueFn(*this, Info->getSavedStateTy(), CallInfo);
-	Value *SVoid = B.CreateBitCast(Info->getSavedState(), llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx)));
-	B.CreateCall2(IssueFn, PF, SVoid);
-
-	// __cilkrts_detach_pending(pf);
-	B.CreateCall(CILKRTS_FUNC(detach_pending, *this), PF);
-
-	// return;
-	B.CreateRetVoid();
-    }
-
-    // Modify terminator
-    {
-	CGBuilderTy B(SFCreate);
-
-	// sf->df_issue_fn = &spawn_helper_issue_fn; // -- args = (s)
-	Value *IssueFn
-	    = 0; // GenerateDataflowIssueFn(*this, Info->getSavedStateTy(), CallInfo);
-	StoreField(B, IssueFn, SF, StackFrameBuilder::df_issue_fn);
-
-	// sf->args_tags = (char *)s;
-	Value *SP = Info->getSavedState();
-	Value *S = B.CreateLoad(SP);
-	Value *SVoid = B.CreateBitCast(S, llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx)));
-	StoreField(B, SVoid, SF, StackFrameBuilder::args_tags);
-
-	// Link in task graph (before detach)
-	// if( !PARENT_SYNCED ) {
-	//    sf->flags |= CILK_FRAME_DATAFLOW_ISSUED;
-	//    spawn_helper_issue_fn( 0, s ); // TODO: sf->tags, sf->args, x );
-	//    assert( sf->call_parent->df_issue_child == 0 );
-	// } else
-	//    sf->call_parent->df_issue_child = sf;
-
-	BasicBlock *Sync = BasicBlock::Create(Ctx, "cilk.spawn.synced");
-	BasicBlock *Unsync = BasicBlock::Create(Ctx, "cilk.spawn.unsynced");
-	Value *CurSF;
-	{
-	    // TODO - integrate this with the ini_ready check result, which should move into this function
-
-	    // First, insert a check to see if the parent's stack frame is SYNCHED.
-	    // If SYNCHED, then no need to track dataflow dependences.
-	    Value *Worker = B.CreateCall(CILKRTS_FUNC(get_tls_worker, *this));
-
-	    // Poll if parent is synced
-	    CurSF = LoadField(B, Worker, WorkerBuilder::current_stack_frame);
-	    Value *Flags = LoadField(B, CurSF, StackFrameBuilder::flags);
-	    Value *SFlag = B.CreateAnd(Flags,
-				       ConstantInt::get(Flags->getType(),
-							CILK_FRAME_UNSYNCHED));
-	    Value *Zero = Constant::getNullValue(SFlag->getType());
-
-	    Value *ParentSynced = B.CreateICmpEQ(SFlag, Zero);
-	    ParentSynced->setName(parent_synced_name);
-
-	    B.CreateCondBr(ParentSynced, Sync, Unsync);
-	}
-
-	EmitBlock(Sync);
-	{
-	    CGBuilderTy &B = Builder;
-
-	    //    sf->flags |= CILK_FRAME_DATAFLOW_ISSUED;
-	    Value *Flags = LoadField(B, SF, StackFrameBuilder::flags);
-	    Value *SFlag
-		= B.CreateOr(Flags,
-			     ConstantInt::get(Flags->getType(),
-					      CILK_FRAME_DATAFLOW_ISSUED));
-	    StoreField(B, SFlag, SF, StackFrameBuilder::flags);
-
-	    //    spawn_helper_issue_fn( 0, s );
-	    Value *SFNull = ConstantPointerNull::get(llvm::PointerType::getUnqual(TypeBuilder<__cilkrts_pending_frame, false>::get(Ctx)));
-	    Value *S = B.CreateLoad(Info->getSavedState());
-	    Value *SVoid = B.CreateBitCast(S, llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx)));
-	    B.CreateCall2(IssueFn, SFNull, SVoid);
-
-	    B.CreateBr(SFDetach);
-	}
-
-	EmitBlock(Unsync);
-	{
-	    CGBuilderTy &B = Builder;
-	    StoreField(B, SF, CurSF, StackFrameBuilder::df_issue_child);
-	    B.CreateBr(SFDetach);
+	    llvm::Value *RL2 = LoadField(B2, ArgsReload, SavedStateArgStart+i);
+	    ReplaceAllReachableUses(ReachableBBs, Arg, RL2);
 	}
     }
 }
-#endif
 
 /// \brief Emit a call to the __cilk_sync function.
 void CGCilkPlusRuntime::EmitCilkSync(CodeGenFunction &CGF) {
@@ -2997,7 +2980,6 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
 
   llvm::Type *Int8Ty = llvm::Type::getInt8Ty(Ctx);
   llvm::Type *Int8PtrTy = llvm::PointerType::getUnqual(Int8Ty);
-  llvm::Type *Int32Ty = llvm::Type::getInt32Ty(Ctx);
   llvm::Type *Int1Ty = llvm::Type::getInt1Ty(Ctx);
 
   // The stack frame is common to both dataflow and non-dataflow cases
@@ -3017,10 +2999,8 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
     // Check flag to see if we jump to reload_bb immediately or not
     llvm::Value *Flag = LookupHelperFlag(CGF);
 
-    BasicBlock *IsFullBB = CGF.createBasicBlock("__cilk_is_full");
     BasicBlock *CallFnBB = CGF.createBasicBlock("__cilk_call_fn.0");
     BasicBlock *ReloadBB = CGF.createBasicBlock("__cilk_reload");
-    BasicBlock *SyncBB = CGF.createBasicBlock("__cilk_sync");
     BasicBlock *UnsyncBB = CGF.createBasicBlock("__cilk_unsync");
     BasicBlock *SaveStateBB = CGF.createBasicBlock("__cilk_save_state");
     Info->setReloadBB(ReloadBB);
@@ -3029,7 +3009,7 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
     // state and call function.
     Value *DoCall
 	= CGF.Builder.CreateICmpNE(Flag, ConstantInt::get(Flag->getType(), 0));
-    CGF.Builder.CreateCondBr(DoCall, CallFnBB, IsFullBB);
+    CGF.Builder.CreateCondBr(DoCall, CallFnBB, UnsyncBB);
 	
     CGF.EmitBlock(CallFnBB);
     {
@@ -3047,55 +3027,15 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
 	B.CreateBr(ReloadBB);
     }
 
-    // If flags is 0, select between a pending frame and a full frame.
-    CGF.EmitBlock(IsFullBB);
-    {
-	CGBuilderTy &B = CGF.Builder;
-
-	// If SYNCHED, then no need to track dataflow dependences.
-	Value *Worker = B.CreateCall(CILKRTS_FUNC(get_tls_worker, CGF));
-
-	// Poll if parent is synced
-	Value *CurSF
-	    = LoadField(B, Worker, WorkerBuilder::current_stack_frame);
-	Value *Flags = LoadField(B, CurSF, StackFrameBuilder::flags);
-	Value *SFlag = B.CreateAnd(Flags,
-				   ConstantInt::get(Flags->getType(),
-						    CILK_FRAME_UNSYNCHED));
-	Value *Zero = Constant::getNullValue(SFlag->getType());
-	Value *Cond = B.CreateICmpEQ(SFlag, Zero);
-	B.CreateStore(Cond, ParentSynced);
-	B.CreateCondBr(Cond, SyncBB, UnsyncBB);
-    }
-
     // The parent frame is not synched. Check for pending frame.
     CGF.EmitBlock(UnsyncBB);
     {
 	CGBuilderTy &B = CGF.Builder;
 	llvm::Function *ReadyFn = CreateIniReadyFn(CGF);
-	llvm::Value *PF = CGF.Builder.CreateCall(ReadyFn, Info->getContextValue());
+	llvm::Value *PF
+	    = CGF.Builder.CreateCall(ReadyFn, Info->getContextValue());
 	PF->setName(pending_frame_name);
-
-	BasicBlock *ElectBB = CGF.createBasicBlock("__cilk_elect_saved_state");
-
-	Value *PFNZ
-	    = B.CreateICmpNE(PF, ConstantPointerNull::get(
-				 cast<llvm::PointerType>(PF->getType())));
-	B.CreateCondBr(PFNZ, ElectBB, SaveStateBB);
-
-	CGF.EmitBlock(ElectBB);
-	Value *ArgsTags = LoadField(B, PF, PendingFrameBuilder::args_tags);
-	B.CreateStore(ArgsTags, SavedStatePtr);
 	B.CreateBr(SaveStateBB);
-    }
-
-    // The parent frame is synched. Proceed with stack frame.
-    CGF.EmitBlock(SyncBB);
-    {
-	// Initialize the worker to null. If this worker is still null on exit,
-	// then there is no stack frame constructed for spawning and there is no
-	// need to cleanup this stack frame.
-	CGF.Builder.CreateCall(GetCilkResetWorkerFn(CGF), SF);
     }
 
     // From here on, we generate code to save the state, reload it and call
@@ -3103,6 +3043,11 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
     // particularly to skip the save state code and immediately jump to the
     // reload code.
     CGF.EmitBlock(SaveStateBB);
+
+    // Initialize the worker to null. If this worker is still null on exit,
+    // then there is no stack frame constructed for spawning and there is no
+    // need to cleanup this stack frame.
+    CGF.Builder.CreateCall(GetCilkResetWorkerFn(CGF), SF);
 
     // Do this only once:
     // Push cleanups associated to this stack frame initialization.
@@ -3152,7 +3097,23 @@ void CGCilkPlusRuntime::EmitCilkHelperPrologue(CodeGenFunction &CGF) {
       // Value *Flag = LookupHelperFlag(CGF);
       // Value *Zero = ConstantInt::get(Flag->getType(), 0);
       // Value *Cond = CGF.Builder.CreateICmpNE(Flag, Zero);
-      Value *Cond = CGF.Builder.CreateLoad(LookupParentSynced(CGF));
+      // Value *Cond = CGF.Builder.CreateLoad(LookupParentSynced(CGF));
+      // Value *Ready = CGF.Builder.CreateLoad(LookupPendingFrame(CGF));
+/* dbg sept 2015
+*/
+      Value *Ready = LookupPendingFrame(CGF);
+      llvm::PHINode *ReadyPHI
+	  = PHINode::Create(Ready->getType(), 1, "", &SaveBB->front());
+      ReadyPHI->addIncoming(Ready, SaveBB->getSinglePredecessor());
+      Value *Zero = ConstantPointerNull::get(
+	  cast<llvm::PointerType>(Ready->getType()));
+/*
+      Value *Ready = LookupPendingFrame(CGF);
+      Value *Zero = ConstantPointerNull::get(
+	  cast<llvm::PointerType>(Ready->getType()));
+      Value *Cond = CGF.Builder.CreateICmpNE(Zero, Zero);
+*/
+      Value *Cond = CGF.Builder.CreateICmpNE(ReadyPHI, Zero);
       CGF.Builder.CreateCondBr(Cond, TermBB, ReloadBB);
 
       // Terminate. Exception handling code will be added to this.
@@ -3184,11 +3145,6 @@ void CGCilkPlusRuntime::
 EmitCilkHelperDataFlowPrologue(CodeGenFunction &CGF,
 			       const CGFunctionInfo &CallInfo,
 			       SmallVector<llvm::Value *, 16> & Args) {
-    llvm::errs() << " *** EmitCilkHelperDataFlowPrologue ***\n";
-
-    LLVMContext &Ctx = CGF.getLLVMContext();
-    CGBuilderTy &B = CGF.Builder;
-
     CodeGenFunction::CGCilkDataflowSpawnInfo *Info =
 	dyn_cast<CodeGenFunction::CGCilkDataflowSpawnInfo>(CGF.CapturedStmtInfo);
     assert(Info);
