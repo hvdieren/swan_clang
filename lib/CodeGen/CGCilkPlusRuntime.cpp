@@ -95,8 +95,10 @@ typedef void (*__cilk_abi_f64_t)(void *data, cilk64_t low, cilk64_t high);
 
 typedef void (__cilkrts_enter_frame)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_enter_frame_1)(__cilkrts_stack_frame *sf);
+typedef void (__cilkrts_enter_frame_df)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_enter_frame_fast)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_enter_frame_fast_1)(__cilkrts_stack_frame *sf);
+typedef void (__cilkrts_enter_frame_fast_df)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_leave_frame)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_sync)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_return_exception)(__cilkrts_stack_frame *sf);
@@ -115,7 +117,9 @@ typedef void (cilk_func)(__cilkrts_stack_frame *);
 
 typedef uint32_t (__cilkrts_obj_metadata_ini_ready)(__cilkrts_obj_metadata * meta,
 						    uint32_t g);
-typedef void (__cilkrts_obj_metadata_wakeup_args)(__cilkrts_ready_list *,
+typedef void (__cilkrts_obj_metadata_wakeup)(__cilkrts_ready_list *,
+					     __cilkrts_obj_metadata * meta);
+typedef void (__cilkrts_obj_metadata_wakeup_hard)(__cilkrts_ready_list *,
 						  __cilkrts_obj_metadata * meta);
 typedef __cilkrts_pending_frame *(__cilkrts_pending_frame_create)(uint32_t);
 typedef void (__cilkrts_pending_call_fn)(__cilkrts_pending_frame *);
@@ -156,6 +160,7 @@ DEFAULT_GET_CILKRTS_FUNC(get_tls_worker)
 DEFAULT_GET_CILKRTS_FUNC(bind_thread_1)
 DEFAULT_GET_CILKRTS_FUNC(pending_frame_create)
 DEFAULT_GET_CILKRTS_FUNC(detach_pending)
+DEFAULT_GET_CILKRTS_FUNC(obj_metadata_wakeup_hard)
 
 typedef std::map<llvm::LLVMContext*, llvm::StructType*> TypeBuilderCache;
 
@@ -1101,6 +1106,112 @@ static Function *Get__cilkrts_enter_frame_1(CodeGenFunction &CGF) {
   return Fn;
 }
 
+/// \brief Get or create a LLVM function for __cilkrts_enter_frame_df.
+/// It is equivalent to the following C code
+///
+/// void __cilkrts_enter_frame_df(struct __cilkrts_stack_frame *sf)
+/// {
+///     struct __cilkrts_worker *w = __cilkrts_get_tls_worker();
+///     if (w == 0) { /* slow path, rare */
+///         w = __cilkrts_bind_thread_1();
+///         sf->flags = CILK_FRAME_LAST | CILK_FRAME_VERSION | CILK_FRAME_DATAFLOW;
+///     } else {
+///         sf->flags = CILK_FRAME_VERSION | CILK_FRAME_DATAFLOW;
+///     }
+///     sf->call_parent = w->current_stack_frame;
+///     sf->worker = w;
+///     /* sf->except_data is only valid when CILK_FRAME_EXCEPTING is set */
+///     w->current_stack_frame = sf;
+///     if(sf->call_parent)
+///        sf->call_parent->df_issue_child = sf;
+/// }
+static Function *Get__cilkrts_enter_frame_df(CodeGenFunction &CGF) {
+  Function *Fn = 0;
+
+  if (GetOrCreateFunction<cilk_func>("__cilkrts_enter_frame_df", CGF, Fn,
+                                     Function::AvailableExternallyLinkage))
+    return Fn;
+
+  LLVMContext &Ctx = CGF.getLLVMContext();
+  Value *SF = Fn->arg_begin();
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "", Fn);
+  BasicBlock *SlowPath = BasicBlock::Create(Ctx, "", Fn);
+  BasicBlock *FastPath = BasicBlock::Create(Ctx, "", Fn);
+  BasicBlock *Cont = BasicBlock::Create(Ctx, "", Fn);
+  BasicBlock *SetIssue = BasicBlock::Create(Ctx, "", Fn);
+  BasicBlock *Return = BasicBlock::Create(Ctx, "", Fn);
+
+  llvm::PointerType *WorkerPtrTy = TypeBuilder<__cilkrts_worker*, false>::get(Ctx);
+  StructType *SFTy = StackFrameBuilder::get(Ctx);
+
+  // Block  (Entry)
+  CallInst *W = 0;
+  {
+    CGBuilderTy B(Entry);
+    W = B.CreateCall(CILKRTS_FUNC(get_tls_worker, CGF));
+    Value *Cond = B.CreateICmpEQ(W, ConstantPointerNull::get(WorkerPtrTy));
+    B.CreateCondBr(Cond, SlowPath, FastPath);
+  }
+  // Block  (SlowPath)
+  CallInst *Wslow = 0;
+  {
+    CGBuilderTy B(SlowPath);
+    Wslow = B.CreateCall(CILKRTS_FUNC(bind_thread_1, CGF));
+    llvm::Type *Ty = SFTy->getElementType(StackFrameBuilder::flags);
+    StoreField(B,
+      ConstantInt::get(Ty, CILK_FRAME_LAST | CILK_FRAME_VERSION
+		       | CILK_FRAME_DATAFLOW),
+      SF, StackFrameBuilder::flags);
+    B.CreateBr(Cont);
+  }
+  // Block  (FastPath)
+  {
+    CGBuilderTy B(FastPath);
+    llvm::Type *Ty = SFTy->getElementType(StackFrameBuilder::flags);
+    StoreField(B,
+      ConstantInt::get(Ty, CILK_FRAME_VERSION | CILK_FRAME_DATAFLOW),
+      SF, StackFrameBuilder::flags);
+    B.CreateBr(Cont);
+  }
+  // Block  (Cont)
+  Value *CP = 0;
+  Value *NullSF
+      = ConstantPointerNull::get(cast<llvm::PointerType>(CP->getType()));
+  {
+    CGBuilderTy B(Cont);
+    Value *Wfast = W;
+    PHINode *W  = B.CreatePHI(WorkerPtrTy, 2);
+    W->addIncoming(Wslow, SlowPath);
+    W->addIncoming(Wfast, FastPath);
+
+    CP = LoadField(B, W, WorkerBuilder::current_stack_frame);
+    StoreField(B, CP, SF, StackFrameBuilder::call_parent);
+
+    StoreField(B, W, SF, StackFrameBuilder::worker);
+    StoreField(B, SF, W, WorkerBuilder::current_stack_frame);
+
+    Value *Cond = B.CreateICmpNE(CP, NullSF);
+    B.CreateCondBr(Cond,SetIssue,Return);
+  }
+
+  {
+      CGBuilderTy B(SetIssue);
+      StoreField(B, SF, CP, StackFrameBuilder::df_issue_child);
+      B.CreateRetVoid();
+  }
+
+  {
+      CGBuilderTy B(Return);
+      B.CreateRetVoid();
+  }
+
+  Fn->addFnAttr(Attribute::InlineHint);
+
+  return Fn;
+}
+
+
 /// \brief Get or create a LLVM function for __cilkrts_enter_frame_fast.
 /// It is equivalent to the following C code
 ///
@@ -1146,6 +1257,54 @@ static Function *Get__cilkrts_enter_frame_fast_1(CodeGenFunction &CGF) {
   return Fn;
 }
 
+/// \brief Get or create a LLVM function for __cilkrts_enter_frame_fast_df.
+/// It is equivalent to the following C code
+///
+/// void __cilkrts_enter_frame_fast_df(struct __cilkrts_stack_frame *sf)
+/// {
+///     struct __cilkrts_worker *w = __cilkrts_get_tls_worker();
+///     sf->flags = CILK_FRAME_VERSION;
+///     sf->call_parent = w->current_stack_frame;
+///     sf->worker = w;
+///     /* sf->except_data is only valid when CILK_FRAME_EXCEPTING is set */
+///     w->current_stack_frame = sf;
+///     sf->call_parent->df_issue_child = sf;
+/// }
+static Function *Get__cilkrts_enter_frame_fast_df(CodeGenFunction &CGF) {
+  Function *Fn = 0;
+
+  if (GetOrCreateFunction<cilk_func>("__cilkrts_enter_frame_fast_df", CGF, Fn,
+                                     Function::InternalLinkage))
+                                     // Function::AvailableExternallyLinkage))
+    return Fn;
+
+  LLVMContext &Ctx = CGF.getLLVMContext();
+  Value *SF = Fn->arg_begin();
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "", Fn);
+
+  CGBuilderTy B(Entry);
+  Value *W = B.CreateCall(CILKRTS_FUNC(get_tls_worker, CGF));
+  StructType *SFTy = StackFrameBuilder::get(Ctx);
+  llvm::Type *Ty = SFTy->getElementType(StackFrameBuilder::flags);
+
+  StoreField(B,
+    ConstantInt::get(Ty, CILK_FRAME_VERSION),
+    SF, StackFrameBuilder::flags);
+  Value *CP = LoadField(B, W, WorkerBuilder::current_stack_frame);
+  StoreField(B, CP, SF, StackFrameBuilder::call_parent);
+  StoreField(B, W, SF, StackFrameBuilder::worker);
+  StoreField(B, SF, W, WorkerBuilder::current_stack_frame);
+
+  StoreField(B, SF, CP, StackFrameBuilder::df_issue_child);
+
+  B.CreateRetVoid();
+
+  Fn->addFnAttr(Attribute::InlineHint);
+
+  return Fn;
+}
+
 
 /// \brief Get or create a LLVM function for __cilk_parent_prologue.
 /// It is equivalent to the following C code
@@ -1169,6 +1328,7 @@ static Function *GetCilkParentPrologue(CodeGenFunction &CGF) {
 
   // __cilkrts_enter_frame_1(sf)
   B.CreateCall(CILKRTS_FUNC(enter_frame_1, CGF), SF);
+// TODO: DataflowParentPrologue calls enter_frame_df
 
   B.CreateRetVoid();
 
@@ -1274,7 +1434,7 @@ static llvm::Function *GetCilkHelperPrologue(CodeGenFunction &CGF) {
 /// void __cilk_df_helper_prologue(__cilkrts_stack_frame *sf, char *at,
 ///                                __cilkrts_issue_fn_ty issue_fn,
 ///                                bool PARENT_SYNCED) {
-///   __cilkrts_enter_frame_fast_1(sf);
+///   __cilkrts_enter_frame_fast_df(sf);
 ///   sf->df_issue_fn = issue_fn;
 ///   sf->args_tags = (char *)at;
 ///   if( !PARENT_SYNCED ) {
@@ -1306,8 +1466,8 @@ static llvm::Function *GetCilkDataflowHelperPrologue(CodeGenFunction &CGF) {
   BasicBlock *Exit = CGF.createBasicBlock("exit", Fn);
   CGBuilderTy B(Entry);
 
-  // __cilkrts_enter_frame_fast_1(sf); -- TODO: enter_frame_fast_df
-  B.CreateCall(CILKRTS_FUNC(enter_frame_fast_1, CGF), SF);
+  // __cilkrts_enter_frame_fast_df(sf);
+  B.CreateCall(CILKRTS_FUNC(enter_frame_fast_df, CGF), SF);
 
   // sf->df_issue_fn = issue_fn;
   // sf->args_tags = (char *)at;
@@ -1561,30 +1721,99 @@ static Function *Get__cilkrts_obj_metadata_ini_ready(CodeGenFunction &CGF) {
   return Fn;
 }
 
-/// \brief Get or create a LLVM function for __cilkrts_obj_metadata_wakeup_args.
+/// \brief Get or create a LLVM function for __cilkrts_obj_metadata_wakeup.
 /// It is equivalent to the following C code
 ///
-/// void __cilkrts_obj_metadata_wakeup_args(struct __cilkrts_ready_list *rlist,
-///                                         struct __cilkrts_obj_metadata *meta ) {
-///   ...
+/// void __cilkrts_obj_metadata_wakeup(struct __cilkrts_ready_list *rlist,
+///                                    struct __cilkrts_obj_metadata *meta ) {
+///     lock();
+///     if( --oldest.num_tasks > 0 ) {
+///         unlock();
+///     } else if( num_gens == 1 ) {
+///         pop_generation();
+///         youngest.clr_tasks();
+///         unlock();
+///     } else
+///         wakeup_hard(rlist, meta);
 /// }
-static Function *Get__cilkrts_obj_metadata_wakeup_args(CodeGenFunction &CGF) {
+static Function *Get__cilkrts_obj_metadata_wakeup(CodeGenFunction &CGF) {
   Function *Fn = 0;
 
-  if (GetOrCreateFunction<__cilkrts_obj_metadata_wakeup_args>(
-	  "__cilkrts_obj_metadata_wakeup_args", CGF, Fn))
+  if (GetOrCreateFunction<__cilkrts_obj_metadata_wakeup>(
+	  "__cilkrts_obj_metadata_wakeup", CGF, Fn))
     return Fn;
 
   // If we get here we need to add the function body
   LLVMContext &Ctx = CGF.getLLVMContext();
 
-  Value * rlist = Fn->arg_begin();
-  Value * meta = ++Fn->arg_begin();
+  Value * RL = Fn->arg_begin();
+  Value * Meta = ++Fn->arg_begin();
 
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+  BasicBlock *ChkOneGen = BasicBlock::Create(Ctx, "chk_one_gen", Fn);
+  BasicBlock *OneGen = BasicBlock::Create(Ctx, "one_gen", Fn);
+  BasicBlock *Unlock = BasicBlock::Create(Ctx, "unlock", Fn);
+  BasicBlock *Hard = BasicBlock::Create(Ctx, "hard", Fn);
 
-  CGBuilderTy B(Entry);
-  B.CreateRetVoid();
+  Value *Lock;
+  {
+      CGBuilderTy B(Entry);
+
+      // lock();
+      Lock = GEP(B, Meta, ObjMetadataBuilder::mutex);
+      // Call(spin_mutex_lock, Lock);
+
+      // if( /*likely*/( --oldest.num_tasks > 0 ) ) {
+      Value *NTasks
+	  = LoadField(B, Meta, ObjMetadataBuilder::oldest_num_tasks);
+      Value *NTasksMinOne
+	  = B.CreateAdd(NTasks, ConstantInt::get(NTasks->getType(), 1));
+      StoreField(B, NTasksMinOne, Meta, ObjMetadataBuilder::oldest_num_tasks);
+      Value *Comp
+	  = B.CreateICmpUGT(NTasksMinOne,
+			    ConstantInt::get(NTasks->getType(), 0));
+      B.CreateCondBr(Comp, Unlock, ChkOneGen);
+  }
+
+  Value *NumGens;
+  {
+      CGBuilderTy B(ChkOneGen);
+      // } else if( /*likely*/( num_gens == 1 ) ) {
+      NumGens = LoadField(B, Meta, ObjMetadataBuilder::num_gens);
+      Value *Comp
+	  = B.CreateICmpEQ(NumGens,
+			   ConstantInt::get(NumGens->getType(), 1));
+      B.CreateCondBr(Comp, Hard, OneGen);
+  }
+
+  {
+      CGBuilderTy B(OneGen);
+      // pop_generation(); // num_gens = 0
+      StoreField(B, ConstantInt::get(NumGens->getType(), 0), Meta,
+		 ObjMetadataBuilder::num_gens);
+      // youngest.clr_tasks(); // g = g_empty
+      StoreField(B, ConstantInt::get(NumGens->getType(), CILK_OBJ_GROUP_EMPTY),
+		 Meta, ObjMetadataBuilder::youngest_group);
+      B.CreateBr(Unlock);
+  }
+
+  {
+      CGBuilderTy B(Unlock);
+      // unlock();
+      // Call(spin_mutex_unlock, Lock);
+      B.CreateRetVoid();
+  }
+
+  {
+      CGBuilderTy B(Hard);
+      Function * HardFn = CILKRTS_FUNC(obj_metadata_wakeup_hard, CGF);
+      Value *CRL
+	  = B.CreatePointerCast(RL, (HardFn->arg_begin())->getType());
+      Value *CMeta
+	  = B.CreatePointerCast(Meta, (++HardFn->arg_begin())->getType());
+      B.CreateCall2(HardFn, CRL, CMeta);
+      B.CreateRetVoid();
+  }
 
   Fn->addFnAttr(Attribute::InlineHint);
  
@@ -1701,7 +1930,7 @@ Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
 
     Function::arg_iterator I = Fn->arg_begin();
     Value *PF = I;     // pending_frame
-    Value *OBJ = ++I;  // obj_metadata
+    Value *Meta = ++I;  // obj_metadata
     Value *TLN = ++I;  // task_list_node
     Value *GRP = ++I;    // group
 
@@ -1723,11 +1952,11 @@ Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
 	StoreField(B, PF, TLN, TaskListNodeBuilder::st_task);
 
 	// lock();
-	Value *Lock = GEP(B, OBJ, ObjMetadataBuilder::mutex);
+	Value *Lock = GEP(B, Meta, ObjMetadataBuilder::mutex);
 	// Call(spin_mutex_lock, Lock);
 
 	// bool joins = youngest.match_group( g );
-	Value *G = LoadField(B, OBJ, ObjMetadataBuilder::youngest_group);
+	Value *G = LoadField(B, Meta, ObjMetadataBuilder::youngest_group);
 	Value *Empty = ConstantInt::get(GRP->getType(), CILK_OBJ_GROUP_EMPTY);
 	Value *GrpOrEmpty = B.CreateOr(GRP, Empty);
 	Value *NotWrite = ConstantInt::get(GRP->getType(), CILK_OBJ_GROUP_NOT_WRITE);
@@ -1742,7 +1971,7 @@ Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
 	PushG = B.CreateICmpEQ(AndG2, Zero);
 
 	// bool ready = joins & ( num_gens <= 1 );
-	Value *NumGens = LoadField(B, OBJ, ObjMetadataBuilder::num_gens);
+	Value *NumGens = LoadField(B, Meta, ObjMetadataBuilder::num_gens);
 	Value *One = ConstantInt::get(NumGens->getType(), 1);
 	Value *ActiveGen = B.CreateICmpULE(NumGens, One);
 	Value *Ready = B.CreateAnd(Joins, ActiveGen);
@@ -1751,18 +1980,18 @@ Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
 	// a.k.a.: num_gens += pushg;
 	Value *PushGWide = B.CreateZExt(PushG, NumGens->getType());
 	Value *NumGensInc = B.CreateAdd(NumGens, PushGWide);
-	StoreField(B, NumGensInc, OBJ, ObjMetadataBuilder::num_gens);
+	StoreField(B, NumGensInc, Meta, ObjMetadataBuilder::num_gens);
 
 	// oldest.num_tasks += ready;
-	Value *NumTasks = LoadField(B, OBJ, ObjMetadataBuilder::oldest_num_tasks);
+	Value *NumTasks = LoadField(B, Meta, ObjMetadataBuilder::oldest_num_tasks);
 	Value *NTOne = ConstantInt::get(NumTasks->getType(), 1);
 	Value *NumTasksInc = B.CreateAdd(NumTasks, NTOne);
 
-	StoreField(B, NumTasksInc, OBJ, ObjMetadataBuilder::oldest_num_tasks);
+	StoreField(B, NumTasksInc, Meta, ObjMetadataBuilder::oldest_num_tasks);
 
 	// youngest.open_group( g ); // redundant if joins == true
 	// a.k.a.: youngest.g = g;
-	StoreField(B, GRP, OBJ, ObjMetadataBuilder::youngest_group);
+	StoreField(B, GRP, Meta, ObjMetadataBuilder::youngest_group);
 
 	// if( !ready ) {
 	B.CreateCondBr(Ready, Unlock, NotReady);
@@ -1779,7 +2008,7 @@ Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
 			  llvm::SequentiallyConsistent);
 
 	// __cilkrts_task_list_node * old_tail = tasks.tail;
-	Value *Tasks = GEP(B, OBJ, ObjMetadataBuilder::tasks);
+	Value *Tasks = GEP(B, Meta, ObjMetadataBuilder::tasks);
 	Value *OldTail = LoadField(B, Tasks, TaskListBuilder::tail);
 
 	// tasks.tail->it_next = tags;
@@ -1810,7 +2039,7 @@ Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
 	CGBuilderTy B(Unlock);
 
 	// unlock();
-	Value *Lock = GEP(B, OBJ, ObjMetadataBuilder::mutex);
+	Value *Lock = GEP(B, Meta, ObjMetadataBuilder::mutex);
 	// Call(spin_mutex_unlock, Lock);
 
 	// TODO: return true if ready after all (?)
@@ -2122,17 +2351,30 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
       Value *PF
 	  = B.CreateCall(CILKRTS_FUNC(pending_frame_create, CGF), Size);
 
+      // Store arguments in args_tags
+      unsigned i=0;
+      Value *ATVoid = LoadField(B, PF, PendingFrameBuilder::args_tags);
+      Value *ArgsTags = B.CreateBitCast(ATVoid, llvm::PointerType::getUnqual(Info->getSavedStateTy()));
+      Value *Args = GEP(B, ArgsTags, 0);
+      for( CallExpr::const_arg_iterator I=ArgBeg, E=ArgEnd; I != E; ++I, ++i ) {
+	  const clang::Type * type = I->getType().getTypePtr();
+	  if( IsDataflowType( type ) ) {
+	      Value *VersionedRef = LoadField(B, SavedState, i);
+	      Value *Version = LoadField(B, VersionedRef, VersionedBuilder::version);
+	      StoreField(B, Version, GEP(B, Args, i), 0);
+	  }
+      }
+
       // Store generated helper call_fn into state
       // pf->call_fn = &spawn_helper_call_fn;
       Value *CallFn = CreateCallFn(CGF, CGF.CurFn);
       StoreField(B, CallFn, PF, PendingFrameBuilder::call_fn);
 
-      // __cilkrts_detach_pending(pf); -- not yet
-      // B.CreateCall(CILKRTS_FUNC(detach_pending, CGF), PF);
+      // __cilkrts_detach_pending(pf);
+      B.CreateCall(CILKRTS_FUNC(detach_pending, CGF), PF);
 
-      // spawn_helper_issue_fn( pf, s ); -- not yet
-      // Value *IssueFn = GenerateDataflowIssueFn(CGF, State, CallInfo);
-      // B.CreateCall2(IssueFn, PF, S);
+      // spawn_helper_issue_fn( pf, s );
+      B.CreateCall2(Info->getIssueFn(), PF, ArgsTags);
 
       B.CreateRet(PF);
   }
@@ -2318,17 +2560,16 @@ CreateReleaseFn(CodeGenFunction &CGF,
   Value *Args = GEP(B, S, 0);
   // Value *Tags = GEP(B, S, 1);
 
-  // Call __cilkrts_obj_metadata_wakeup_args for every dataflow argument
+  // Call __cilkrts_obj_metadata_wakeup for every dataflow argument
+  Function * WakeFn = CILKRTS_FUNC(obj_metadata_wakeup, CGF);
   unsigned i=0;
   for( CallExpr::const_arg_iterator I=ArgBeg, E=ArgEnd; I != E; ++I ) {
       const clang::Type * type = I->getType().getTypePtr();
       if( IsDataflowType( type ) ) {
-	  Function * WakeFn = CILKRTS_FUNC(obj_metadata_wakeup_args, CGF);
 	  Value *Var = LoadField(B, GEP(B, Args, i), 0);
 	  Value *Meta = GEP(B, Var, ObjVersionBuilder::meta);
 	  // struct.__cilkrts_obj_metadata != __cilkrts_obj_metadata
 	  Value *CMeta = B.CreatePointerCast(Meta, (++WakeFn->arg_begin())->getType());
-	  // Value *Tag = GEP(B, Tags, i);
 	  // TODO: This call could be slightly more efficient if we knew it was
 	  // read or write because with write you know that the generation
 	  // (should) drop empty.
@@ -2813,9 +3054,9 @@ ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
     llvm::errs() << " *** Done with ConstructCilkDataflowSavedState ***\n";
 
     // Write the body of the ini_ready_fn() now that we know the arguments
-    CompleteIniReadyFn(*this, ArgBeg, ArgEnd);
     CreateIssueFn(*this, ArgBeg, ArgEnd);
     CreateReleaseFn(*this, ArgBeg, ArgEnd);
+    CompleteIniReadyFn(*this, ArgBeg, ArgEnd);
 }
 
 static void
@@ -2858,14 +3099,6 @@ RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
     // const CGFunctionInfo &CallInfo = *Info->getCallInfo();
     RValue RV = Info->getRValue();
 
-    llvm::errs() << " *** RewriteHelperFunction ***\n";
-
-    llvm::LLVMContext &Ctx = getLLVMContext();
-
-    // Get the __cilkrts_stack_frame
-    Value *SF = LookupStackFrame(*this);
-    assert(SF && "null stack frame unexpected");
-
     CGCilkDataflowSpawnInfo::ARMapTy &ReplaceValues = Info->getReplaceValues();
     for( CGCilkDataflowSpawnInfo::ARMapTy::iterator I=ReplaceValues.begin(),
 	     E=ReplaceValues.end(); I != E; ++I ) {
@@ -2882,21 +3115,7 @@ RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
     else if( llvm::InvokeInst * TheInvoke = dyn_cast<llvm::InvokeInst>(RVInst) )
 	NumArgs = TheInvoke->getNumArgOperands();
 
-    /*
-    llvm::BasicBlock::iterator ii(RVInst);
-    llvm::BasicBlock * SaveBB = RVInst->getParent();
-    llvm::BasicBlock * ReloadBB
-	= SaveBB->splitBasicBlock(ii,"__cilk_reload_args");
-    // ii now invalid
-
-    Builder.SetInsertPoint(ReloadBB);
-    */
-
-    // BasicBlock * ReloadBB = Info->getReloadBB();
     BasicBlock * SaveBB = Info->getSaveBB();
-
-    // Erase terminator
-    // SaveBB->getTerminator()->eraseFromParent();
 
     CGBuilderTy B1(BasicBlock::iterator(SaveBB->getTerminator()));
     CGBuilderTy B2(RVInst);
@@ -3036,14 +3255,12 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
   llvm::Value *SF = CreateStackFrame(CGF);
 
   if( Info ) {
-    // Need to avoid inclusion of this in the saved state
-    // llvm::AllocaInst *SavedStateIfReady = CGF.CreateTempAlloca(Int8PtrTy, "");
-    // SavedStateIfReady->setName(saved_state_name);
     llvm::AllocaInst *SavedStatePtr = CGF.CreateTempAlloca(Int8PtrTy, "");
     SavedStatePtr->setName(saved_state_ptr_name);
     llvm::AllocaInst *ParentSynced = CGF.CreateTempAlloca(Int1Ty, "");
     ParentSynced->setName(parent_synced_name);
 
+    // TODO: replace by PHINode
     CGF.Builder.CreateStore(ConstantInt::get(Int1Ty, 0), ParentSynced);
 
     // Check flag to see if we jump to reload_bb immediately or not
@@ -3144,25 +3361,12 @@ void CGCilkPlusRuntime::EmitCilkHelperPrologue(CodeGenFunction &CGF) {
       BasicBlock *ReloadBB = Info->getReloadBB();
 
       // Terminate SaveBB with conditional branch to terminate
-      // Value *Flag = LookupHelperFlag(CGF);
-      // Value *Zero = ConstantInt::get(Flag->getType(), 0);
-      // Value *Cond = CGF.Builder.CreateICmpNE(Flag, Zero);
-      // Value *Cond = CGF.Builder.CreateLoad(LookupParentSynced(CGF));
-      // Value *Ready = CGF.Builder.CreateLoad(LookupPendingFrame(CGF));
-/* dbg sept 2015
-*/
       Value *Ready = LookupPendingFrame(CGF);
       llvm::PHINode *ReadyPHI
 	  = PHINode::Create(Ready->getType(), 1, "", &SaveBB->front());
       ReadyPHI->addIncoming(Ready, SaveBB->getSinglePredecessor());
       Value *Zero = ConstantPointerNull::get(
 	  cast<llvm::PointerType>(Ready->getType()));
-/*
-      Value *Ready = LookupPendingFrame(CGF);
-      Value *Zero = ConstantPointerNull::get(
-	  cast<llvm::PointerType>(Ready->getType()));
-      Value *Cond = CGF.Builder.CreateICmpNE(Zero, Zero);
-*/
       Value *Cond = CGF.Builder.CreateICmpNE(ReadyPHI, Zero);
       CGF.Builder.CreateCondBr(Cond, TermBB, ReloadBB);
 
