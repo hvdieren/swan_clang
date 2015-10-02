@@ -142,6 +142,9 @@ typedef void (__cilkrts_issue_fn_ty)(__cilkrts_pending_frame *, void *);
 typedef void (__cilkrts_release_fn_ty)(void *);
 typedef void (__cilkrts_df_helper_fn_ty)(__cilkrts_stack_frame *, char *,
 					 __cilkrts_issue_fn_ty *, int);
+
+typedef void (__cilkrts_spin_mutex_lock)(spin_mutex *);
+typedef void (__cilkrts_spin_mutex_unlock)(spin_mutex *);
 } // namespace
 
 #define CILKRTS_FUNC(name, CGF) Get__cilkrts_##name(CGF)
@@ -160,6 +163,8 @@ DEFAULT_GET_CILKRTS_FUNC(get_tls_worker)
 DEFAULT_GET_CILKRTS_FUNC(bind_thread_1)
 DEFAULT_GET_CILKRTS_FUNC(pending_frame_create)
 DEFAULT_GET_CILKRTS_FUNC(detach_pending)
+DEFAULT_GET_CILKRTS_FUNC(spin_mutex_lock)
+DEFAULT_GET_CILKRTS_FUNC(spin_mutex_unlock)
 DEFAULT_GET_CILKRTS_FUNC(obj_metadata_wakeup_hard)
 
 typedef std::map<llvm::LLVMContext*, llvm::StructType*> TypeBuilderCache;
@@ -210,7 +215,7 @@ public:
     StructType *Ty = StructType::create(C, "__cilkrts_ready_list");
     cache[&C] = Ty;
     Ty->setBody(
-      TypeBuilder<__cilkrts_pending_frame *,   X>::get(C), // head_next_ready_frame
+      TypeBuilder<__cilkrts_pending_frame *, X>::get(C), // head_next_ready_frame
       TypeBuilder<__cilkrts_pending_frame *, X>::get(C), // tail
       NULL);
     return Ty;
@@ -1761,13 +1766,13 @@ static Function *Get__cilkrts_obj_metadata_wakeup(CodeGenFunction &CGF) {
 
       // lock();
       Lock = GEP(B, Meta, ObjMetadataBuilder::mutex);
-      // Call(spin_mutex_lock, Lock);
+      B.CreateCall(CILKRTS_FUNC(spin_mutex_lock, CGF), Lock);
 
       // if( /*likely*/( --oldest.num_tasks > 0 ) ) {
       Value *NTasks
 	  = LoadField(B, Meta, ObjMetadataBuilder::oldest_num_tasks);
       Value *NTasksMinOne
-	  = B.CreateAdd(NTasks, ConstantInt::get(NTasks->getType(), 1));
+	  = B.CreateAdd(NTasks, ConstantInt::get(NTasks->getType(), -1));
       StoreField(B, NTasksMinOne, Meta, ObjMetadataBuilder::oldest_num_tasks);
       Value *Comp
 	  = B.CreateICmpUGT(NTasksMinOne,
@@ -1783,7 +1788,7 @@ static Function *Get__cilkrts_obj_metadata_wakeup(CodeGenFunction &CGF) {
       Value *Comp
 	  = B.CreateICmpEQ(NumGens,
 			   ConstantInt::get(NumGens->getType(), 1));
-      B.CreateCondBr(Comp, Hard, OneGen);
+      B.CreateCondBr(Comp, OneGen, Hard);
   }
 
   {
@@ -1800,7 +1805,7 @@ static Function *Get__cilkrts_obj_metadata_wakeup(CodeGenFunction &CGF) {
   {
       CGBuilderTy B(Unlock);
       // unlock();
-      // Call(spin_mutex_unlock, Lock);
+      B.CreateCall(CILKRTS_FUNC(spin_mutex_unlock, CGF), Lock);
       B.CreateRetVoid();
   }
 
@@ -1953,7 +1958,7 @@ Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
 
 	// lock();
 	Value *Lock = GEP(B, Meta, ObjMetadataBuilder::mutex);
-	// Call(spin_mutex_lock, Lock);
+	B.CreateCall(CILKRTS_FUNC(spin_mutex_lock, CGF), Lock);
 
 	// bool joins = youngest.match_group( g );
 	Value *G = LoadField(B, Meta, ObjMetadataBuilder::youngest_group);
@@ -1984,7 +1989,7 @@ Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
 
 	// oldest.num_tasks += ready;
 	Value *NumTasks = LoadField(B, Meta, ObjMetadataBuilder::oldest_num_tasks);
-	Value *NTOne = ConstantInt::get(NumTasks->getType(), 1);
+	Value *NTOne = B.CreateZExt(Ready, NumTasks->getType());
 	Value *NumTasksInc = B.CreateAdd(NumTasks, NTOne);
 
 	StoreField(B, NumTasksInc, Meta, ObjMetadataBuilder::oldest_num_tasks);
@@ -2040,7 +2045,7 @@ Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
 
 	// unlock();
 	Value *Lock = GEP(B, Meta, ObjMetadataBuilder::mutex);
-	// Call(spin_mutex_unlock, Lock);
+	B.CreateCall(CILKRTS_FUNC(spin_mutex_unlock, CGF), Lock);
 
 	// TODO: return true if ready after all (?)
 	B.CreateRetVoid();
