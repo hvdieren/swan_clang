@@ -1868,17 +1868,18 @@ CodeGenFunction::GenerateCapturedStmtFunction(const CapturedDecl *CD,
   // Cilk dataflow spawns require additional arguments
   if( isa<CGCilkDataflowSpawnInfo>(CapturedStmtInfo) ) {
       SourceLocation Loc = CD->getBody()->getLocStart();
+      DeclContext *DC = (*CD->param_begin())->getDeclContext();
       QualType SFType = Ctx.getPointerType(Ctx.VoidTy);
       VarDecl *SFDecl
-	  = VarDecl::Create(Ctx, (*CD->param_begin())->getDeclContext(), Loc, Loc,
-			    &Ctx.Idents.get("__cilkrts_sf_arg"), SFType,
-			    Ctx.getTrivialTypeSourceInfo(SFType), SC_None);
+	  = ImplicitParamDecl::Create(Ctx, DC, Loc,
+				      &Ctx.Idents.get("__cilkrts_sf_arg"),
+				      SFType);
       Args.push_back(SFDecl);
       QualType FlagType = Ctx.BoolTy;
       VarDecl *FlagDecl
-	  = VarDecl::Create(Ctx, (*CD->param_begin())->getDeclContext(), Loc, Loc,
-			    &Ctx.Idents.get("__cilkrts_helper_flag"), FlagType,
-			    Ctx.getTrivialTypeSourceInfo(FlagType), SC_None);
+	  = ImplicitParamDecl::Create(Ctx, DC, Loc,
+				      &Ctx.Idents.get("__cilkrts_helper_flag"),
+				      FlagType);
       Args.push_back(FlagDecl);
   }
 
