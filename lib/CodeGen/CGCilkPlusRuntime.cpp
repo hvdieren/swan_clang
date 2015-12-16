@@ -46,6 +46,8 @@ struct __cilkrts_obj_metadata {};
 struct __cilkrts_ready_list {};
 struct __cilkrts_versioned {};
 struct __cilkrts_obj_version {};
+struct __cilkrts_obj_instance {};
+struct __cilkrts_obj_dep {};
 
 enum {
     CILK_OBJ_GROUP_EMPTY = 1,
@@ -135,6 +137,11 @@ typedef void (__cilkrts_obj_metadata_add_task)(__cilkrts_pending_frame *,
 					       int group);
 typedef void (__cilkrts_obj_metadata_add_pending_to_ready_list)(
     __cilkrts_worker *, __cilkrts_pending_frame *);
+
+typedef void (__cilkrts_obj_version_add_ref)(__cilkrts_obj_version *);
+typedef void (__cilkrts_obj_version_del_ref)(__cilkrts_obj_version *);
+typedef void (__cilkrts_obj_version_destroy)(__cilkrts_obj_version *);
+
 typedef void (__cilkrts_move_to_ready_list)(
     __cilkrts_worker *, __cilkrts_ready_list *);
 typedef void (__cilkrts_detach_pending)(__cilkrts_pending_frame *sf);
@@ -163,9 +170,18 @@ DEFAULT_GET_CILKRTS_FUNC(get_tls_worker)
 DEFAULT_GET_CILKRTS_FUNC(bind_thread_1)
 DEFAULT_GET_CILKRTS_FUNC(pending_frame_create)
 DEFAULT_GET_CILKRTS_FUNC(detach_pending)
-DEFAULT_GET_CILKRTS_FUNC(spin_mutex_lock)
-DEFAULT_GET_CILKRTS_FUNC(spin_mutex_unlock)
 DEFAULT_GET_CILKRTS_FUNC(obj_metadata_wakeup_hard)
+DEFAULT_GET_CILKRTS_FUNC(obj_version_destroy)
+
+#define DEFAULT_GET_CILKRTS_ANON_FUNC(name) \
+static llvm::Function *Get__cilkrts_##name(clang::CodeGen::CodeGenFunction &CGF) { \
+   return llvm::cast<llvm::Function>(CGF.CGM.CreateRuntimeFunction( \
+      llvm::TypeBuilder<__cilkrts_##name, false>::get(CGF.getLLVMContext()), \
+      #name)); \
+}
+
+DEFAULT_GET_CILKRTS_ANON_FUNC(spin_mutex_lock)
+DEFAULT_GET_CILKRTS_ANON_FUNC(spin_mutex_unlock)
 
 typedef std::map<llvm::LLVMContext*, llvm::StructType*> TypeBuilderCache;
 
@@ -453,13 +469,60 @@ public:
     cache[&C] = Ty;
     Ty->setBody(
 	TypeBuilder<__cilkrts_obj_metadata, X>::get(C), // meta
+	TypeBuilder<uint32_t, X>::get(C),               // refcnt
+	TypeBuilder<void *, X>::get(C),                 // payload
       NULL);
     return Ty;
   }
   enum {
-    meta
+      meta,
+      refcnt,
+      payload
   };
 };
+
+template <bool X>
+class TypeBuilder<__cilkrts_obj_instance, X> {
+public:
+  static StructType *get(LLVMContext &C) {
+    static TypeBuilderCache cache;
+    TypeBuilderCache::iterator I = cache.find(&C);
+    if (I != cache.end())
+      return I->second;
+    StructType *Ty = StructType::create(C, "__cilkrts_obj_instance");
+    cache[&C] = Ty;
+    llvm::Type * Elements[1] = 
+	{ TypeBuilder<__cilkrts_obj_version*, X>::get(C) }; // version
+    Ty->setBody( Elements, false );
+    return Ty;
+  }
+  enum {
+      version
+  };
+};
+
+// This type models a derived class from obj_instance as in the C++ code,
+// which requires an additional GEP to access the inherited obj_version* field.
+template <bool X>
+class TypeBuilder<__cilkrts_obj_dep, X> {
+public:
+  static StructType *get(LLVMContext &C) {
+    static TypeBuilderCache cache;
+    TypeBuilderCache::iterator I = cache.find(&C);
+    if (I != cache.end())
+      return I->second;
+    StructType *Ty = StructType::create(C, "__cilkrts_obj_dep");
+    cache[&C] = Ty;
+    llvm::Type * Elements[1] = 
+	{ TypeBuilder<__cilkrts_obj_instance, X>::get(C) }; // instance
+    Ty->setBody( Elements, false );
+    return Ty;
+  }
+  enum {
+      instance
+  };
+};
+
 
 template <bool X>
 class TypeBuilder<__cilkrts_versioned, X> {
@@ -495,6 +558,8 @@ typedef llvm::TypeBuilder<__cilkrts_worker, false> WorkerBuilder;
 typedef llvm::TypeBuilder<__cilkrts_pedigree, false> PedigreeBuilder;
 typedef llvm::TypeBuilder<__cilkrts_obj_metadata, false> ObjMetadataBuilder;
 typedef llvm::TypeBuilder<__cilkrts_obj_version, false> ObjVersionBuilder;
+typedef llvm::TypeBuilder<__cilkrts_obj_instance, false> ObjInstanceBuilder;
+typedef llvm::TypeBuilder<__cilkrts_obj_dep, false> ObjDepBuilder;
 typedef llvm::TypeBuilder<__cilkrts_versioned, false> VersionedBuilder;
 typedef llvm::TypeBuilder<__cilkrts_pending_frame, false> PendingFrameBuilder;
 typedef llvm::TypeBuilder<__cilkrts_ready_list, false> ReadyListBuilder;
@@ -509,7 +574,7 @@ static void StoreField(CGBuilderTy &B, Value *Val, Value *Dst, int field) {
   B.CreateStore(Val, GEP(B, Dst, field));
 }
 
-static Value *LoadField(CGBuilderTy &B, Value *Src, int field) {
+static llvm::LoadInst *LoadField(CGBuilderTy &B, Value *Src, int field) {
   return B.CreateLoad(GEP(B, Src, field));
 }
 
@@ -1609,38 +1674,93 @@ GetCilkDataflowHelperEpilogue(CodeGenFunction &CGF) {
   Value *SF = Fn->arg_begin();
 
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
-  BasicBlock *Body = BasicBlock::Create(Ctx, "body", Fn);
+  BasicBlock *PopBlock = BasicBlock::Create(Ctx, "pop_block", Fn);
+  BasicBlock *ChkBlock = BasicBlock::Create(Ctx, "chk_block", Fn);
+  BasicBlock *ReleaseBlock = BasicBlock::Create(Ctx, "release_block", Fn);
+  BasicBlock *LeaveBlock = BasicBlock::Create(Ctx, "leave_block", Fn);
   BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
 
   // Entry
+  Value *Worker = 0;
   {
     CGBuilderTy B(Entry);
 
     // if (sf->worker)
-    Value *C = B.CreateIsNotNull(LoadField(B, SF, StackFrameBuilder::worker));
-    B.CreateCondBr(C, Body, Exit);
+    Worker = LoadField(B, SF, StackFrameBuilder::worker);
+    Value *C = B.CreateIsNotNull(Worker);
+    B.CreateCondBr(C, PopBlock, Exit);
   }
 
-  // Body
+  // PopBlock
   {
-    CGBuilderTy B(Body);
+    CGBuilderTy B(PopBlock);
 
     // __cilkrts_pop_frame(sf);
     B.CreateCall(CILKRTS_FUNC(pop_frame, CGF), SF);
 
-    // release
-    B.CreateCall(ReleaseFn, LoadField(B, SF, StackFrameBuilder::args_tags));
+    ///     if(sf->flags & CILK_FRAME_DATAFLOW_ISSUED)
+    Value *Flags = LoadField(B, SF, StackFrameBuilder::flags);
+    Value *DF_Issued =
+	ConstantInt::get(Flags->getType(), CILK_FRAME_DATAFLOW_ISSUED);
+    Value *And = B.CreateAnd(Flags, DF_Issued);
+    Value *Cmp = B.CreateICmpNE(And, ConstantInt::get(And->getType(), 0));
+    B.CreateCondBr(Cmp, ReleaseBlock, ChkBlock);
+  }
 
-    // __cilkrts_leave_frame(sf);
-    B.CreateCall(CILKRTS_FUNC(leave_frame, CGF), SF);
+  // ChkBlock
+  {
+    CGBuilderTy B(ChkBlock);
 
-    B.CreateBr(Exit);
+    ///        __cilkrts_stack_frame *parent = sf->worker->current_stack_frame;
+    ///        __cilkrts_stack_frame *to_issue;
+    ///        to_issue = CAS(&parent->df_issue_child, sf, 0);
+    ///        do_release = to_issue != sf;
+    Value *Parent = LoadField(B, Worker, WorkerBuilder::current_stack_frame);
+    Value *DFIC = GEP(B, Parent, StackFrameBuilder::df_issue_child);
+    Value *DFICVal = B.CreateLoad(DFIC);
+    Value *NewVal = ConstantPointerNull::get(
+	cast<llvm::PointerType>(DFICVal->getType()));
+// TODO: The CAS is executed for every non-issued dataflow stack frame
+//  This is expensive. Better may be to CAS only if popping the top-level
+//  frame. This means: leave_frame calls into the runtime.
+// Options/thoughts:
+//   + Extend leave_frame to call release_fn
+//   + Perform the check on the CAS-ed field inside the runtime, i.e., inside
+//     leave_frame, while holding a lock on the worker. Holding a lock would
+//     make it unnecessary to CAS as the thief is executing the issue_fn while
+//     holding a lock on the worker (for stealing purposes).
+//   + Anyway, CAS only when popping last frame (check flags?) would be helpful
+//     to avoid overheads.
+    Value *ToIssue
+	= B.CreateAtomicCmpXchg(DFIC, DFICVal, NewVal,
+				llvm::SequentiallyConsistent);
+    Value *Cmp = B.CreateICmpNE(ToIssue, SF);
+    B.CreateCondBr(Cmp, ReleaseBlock, LeaveBlock);
+  }
+
+  // ReleaseBlock
+  {
+      CGBuilderTy B(ReleaseBlock);
+
+      // release
+      B.CreateCall(ReleaseFn, LoadField(B, SF, StackFrameBuilder::args_tags));
+
+      B.CreateBr(LeaveBlock);
+  }
+
+
+  // LeaveBlock
+  {
+      CGBuilderTy B(LeaveBlock);
+      // __cilkrts_leave_frame(sf);
+      B.CreateCall(CILKRTS_FUNC(leave_frame, CGF), SF);
+      B.CreateBr(Exit);
   }
 
   // Exit
   {
-    CGBuilderTy B(Exit);
-    B.CreateRetVoid();
+      CGBuilderTy B(Exit);
+      B.CreateRetVoid();
   }
 
   Fn->addFnAttr(Attribute::InlineHint);
@@ -1918,6 +2038,94 @@ Get__cilkrts_obj_metadata_add_pending_to_ready_list(CodeGenFunction &CGF) {
   return Fn;
 }
 
+/// \brief Get or create a LLVM function for __cilkrts_obj_version_add_ref.
+/// It is equivalent to the following C code
+///
+/// void __cilkrts_obj_version_add_ref( __cilkrts_obj_version *v ) {
+///    __sync_fetch_and_add( &v->refcnt, 1);
+/// }
+static Function *
+Get__cilkrts_obj_version_add_ref(CodeGenFunction &CGF) {
+  Function *Fn = 0;
+
+  if (GetOrCreateFunction<__cilkrts_obj_version_add_ref>(
+	  "__cilkrts_obj_version_add_ref", CGF, Fn))
+    return Fn;
+
+  // If we get here we need to add the function body
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  Value *V = Fn->arg_begin();
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+  CGBuilderTy B(Entry);
+  Value *RefCnt = GEP(B, V, ObjVersionBuilder::refcnt);
+  llvm::PointerType *PTy = cast<llvm::PointerType>(RefCnt->getType());
+  Value *One = ConstantInt::get(PTy->getContainedType(0), 1);
+  B.CreateAtomicRMW(llvm::AtomicRMWInst::Add, RefCnt, One,
+		    llvm::SequentiallyConsistent);
+  B.CreateRetVoid();
+
+  Fn->addFnAttr(Attribute::InlineHint);
+
+  return Fn;
+}
+
+/// \brief Get or create a LLVM function for __cilkrts_obj_version_del_ref.
+/// It is equivalent to the following C code
+///
+/// void __cilkrts_obj_version_del_ref( __cilkrts_obj_version *v ) {
+///    if( __sync_fetch_and_del( &v->refcnt, -1) == 1 )
+///        __cilkrts_obj_version_destroy( v );
+/// }
+static Function *
+Get__cilkrts_obj_version_del_ref(CodeGenFunction &CGF) {
+  Function *Fn = 0;
+
+  if (GetOrCreateFunction<__cilkrts_obj_version_del_ref>(
+	  "__cilkrts_obj_version_del_ref", CGF, Fn))
+    return Fn;
+
+  // If we get here we need to add the function body
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  Value *V = Fn->arg_begin();
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+  BasicBlock *Destroy = BasicBlock::Create(Ctx, "destroy", Fn);
+  BasicBlock *Done = BasicBlock::Create(Ctx, "done", Fn);
+
+  {
+      CGBuilderTy B(Entry);
+      Value *RefCnt = GEP(B, V, ObjVersionBuilder::refcnt);
+      llvm::PointerType *PTy = cast<llvm::PointerType>(RefCnt->getType());
+      Value *One = ConstantInt::get(PTy->getContainedType(0), 1);
+      Value *MinOne = ConstantInt::get(PTy->getContainedType(0), -1);
+      Value *Old = B.CreateAtomicRMW(llvm::AtomicRMWInst::Add, RefCnt, MinOne,
+				     llvm::SequentiallyConsistent);
+      Value *Cond = B.CreateICmpEQ(Old, One);
+      B.CreateCondBr(Cond, Destroy, Done);
+  }
+
+  {
+      CGBuilderTy B(Destroy);
+      B.CreateCall(CILKRTS_FUNC(obj_version_destroy, CGF), V);
+      B.CreateBr(Done);
+  }
+
+  {
+      CGBuilderTy B(Done);
+      B.CreateRetVoid();
+  }
+
+  Fn->addFnAttr(Attribute::InlineHint);
+
+  return Fn;
+}
+
+// TODO: create specialized version to call when issueing executing task
+//       in this case we know what state metadata can be in.
+// TODO: "vectorize" calculation of pushg, joins
 static Function *
 Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
   Function *Fn = 0;
@@ -2307,7 +2515,6 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
   BasicBlock *bb_not_ready = BasicBlock::Create(Ctx, "not_ready", Fn);
   BasicBlock *Unsynced = bb_ready;
 
-
   // Now we need to know which arguments are dataflow and emit a call to
   // __cilkrts_obj_metadata_ini_ready for them.
   unsigned i=0;
@@ -2320,13 +2527,25 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
 	  // on the ready path, creating a new ready block.
 	  // EmitCilkHelperIniReadyArg(CGF, bb_ready, bb_not_ready, Args[i]);
 	  // Value * Meta = CallArgs[i].RV.getScalarVal();
-	  Value *VersionedRef = LoadField(B, SavedState, i);
-	  Value *Version = LoadField(B, VersionedRef, VersionedBuilder::version);
+	  Value *X = GEP(B, SavedState, i); // Type: %"class.cilk::versioned"**
+	  // Value *Y = GEP(B, X, ObjDepBuilder::instance);
+	  // Value *VersionedRef = LoadField(B, Y, ObjInstanceBuilder::version);
+	  Value *VersionedRefRef = B.CreateLoad(X);
+	  Value *ObjVersionPtr = B.CreatePointerCast(
+	      VersionedRefRef,
+	      llvm::PointerType::getUnqual(
+		  llvm::PointerType::getUnqual(ObjVersionBuilder::get(Ctx))));
+	  Value *Version = B.CreateLoad(ObjVersionPtr);
+/*
+	  Value *Version = LoadField(B, ObjVersionPtr, ObjInstanceBuilder::version);
+*/
 	  Value *MetaRaw = GEP(B, Version, ObjVersionBuilder::meta);
-	  Value *Meta
-	      = B.CreateBitCast(MetaRaw,
-				CILKRTS_FUNC(obj_metadata_ini_ready, CGF)
-				->arg_begin()->getType());
+	  Value *Meta = MetaRaw;
+/* Redundant if mapped internally to __cilkrts_obj_instance
+	      = B.CreatePointerCast(MetaRaw,
+				    CILKRTS_FUNC(obj_metadata_ini_ready, CGF)
+				    ->arg_begin()->getType());
+*/
 	  Value *Group
 	      = ConstantInt::get(llvm::Type::getInt32Ty(Ctx),
 				 GetDataflowKind(type));
@@ -2337,8 +2556,6 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
 				       ConstantInt::get(IReady->getType(), 0));
 	  bb_ready = BasicBlock::Create(Ctx, "check_arg1", Fn, bb_not_ready);
 	  B.CreateCondBr(Cond, bb_ready, bb_not_ready);
-
-	  // B.SetInsertPoint(bb_ready);
       }
   }
 
@@ -2362,6 +2579,8 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
 	  = B.CreateCall(CILKRTS_FUNC(pending_frame_create, CGF), Size);
 
       // Store arguments in args_tags
+      // TODO: this is redundant, handled in full by _multi function. Better to
+      //       postpone actual issue call (beware of races...)?
       unsigned i=0;
       Value *ATVoid = LoadField(B, PF, PendingFrameBuilder::args_tags);
       Value *ArgsTags = B.CreateBitCast(ATVoid, llvm::PointerType::getUnqual(Info->getSavedStateTy()));
@@ -2369,9 +2588,23 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
       for( CallExpr::const_arg_iterator I=ArgBeg, E=ArgEnd; I != E; ++I, ++i ) {
 	  const clang::Type * type = I->getType().getTypePtr();
 	  if( IsDataflowType( type ) ) {
-	      Value *VersionedRef = LoadField(B, SavedState, i);
-	      Value *Version = LoadField(B, VersionedRef, VersionedBuilder::version);
-	      StoreField(B, Version, GEP(B, Args, i), 0);
+	      Value *X = GEP(B, SavedState, i);
+	      Value *VersionedRef = B.CreateLoad(X);
+	      Value *VersionRef = B.CreateLoad(VersionedRef);
+	      Value *Version = B.CreatePointerCast(
+		  VersionRef,
+		  llvm::PointerType::getUnqual(ObjVersionBuilder::get(Ctx)));
+/*
+	      Value *ObjVersionPtr = B.CreatePointerCast(
+		  VersionedRef,
+		  llvm::PointerType::getUnqual(ObjVersionBuilder::get(Ctx)));
+*/
+	      // Value *Version = LoadField(B, ObjVersionPtr, VersionedBuilder::version);
+	      // Value *Version = LoadField(B, VersionedRef, ObjInstanceBuilder::version);
+	      // Value *Version = VersionedRef;
+	      StoreField(B, Version, GEP(B, GEP(B, Args, i), ObjDepBuilder::instance), ObjInstanceBuilder::version);
+
+	      // TODO: check that stores happen correctly
 	  }
       }
 
@@ -2380,11 +2613,11 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
       Value *CallFn = CreateCallFn(CGF, CGF.CurFn);
       StoreField(B, CallFn, PF, PendingFrameBuilder::call_fn);
 
-      // __cilkrts_detach_pending(pf);
-      B.CreateCall(CILKRTS_FUNC(detach_pending, CGF), PF);
-
       // spawn_helper_issue_fn( pf, s );
       B.CreateCall2(Info->getIssueFn(), PF, ArgsTags);
+
+      // __cilkrts_detach_pending(pf);
+      B.CreateCall(CILKRTS_FUNC(detach_pending, CGF), PF);
 
       B.CreateRet(PF);
   }
@@ -2444,7 +2677,7 @@ CreateIssueFn(CodeGenFunction &CGF,
   BasicBlock *BBFAA = BasicBlock::Create(Ctx, "bbfaa", Fn);
   BasicBlock *BBAdd = BasicBlock::Create(Ctx, "bbadd", Fn);
   BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
-  Value *PF, *S, *Args, *Tags;
+  Value *PF, *Args, *Tags;
 
   llvm::Type *Int32Ty = llvm::Type::getInt32Ty(Ctx);
 
@@ -2453,9 +2686,10 @@ CreateIssueFn(CodeGenFunction &CGF,
 
       PF = Fn->arg_begin();
       Value *SVoid = ++Fn->arg_begin();
-      S = B.CreateBitCast(SVoid, llvm::PointerType::getUnqual(Info->getSavedStateTy()));
-      Args = GEP(B, S, 0);
-      Tags = GEP(B, S, 1);
+      // Value *ATVoid = LoadField(B, PF, PendingFrameBuilder::args_tags);
+      Value *AT = B.CreateBitCast(SVoid, llvm::PointerType::getUnqual(Info->getSavedStateTy()));
+      Args = GEP(B, AT, 0);
+      Tags = GEP(B, AT, 1);
 
       // Call __cilkrts_obj_metadata_add_task for every dataflow argument
       unsigned i=0;
@@ -2463,7 +2697,11 @@ CreateIssueFn(CodeGenFunction &CGF,
 	  const clang::Type * type = I->getType().getTypePtr();
 	  if( IsDataflowType( type ) ) {
 	      Function * WrFn = CILKRTS_FUNC(obj_metadata_add_task_write, CGF);
-	      Value *Var = LoadField(B, GEP(B, Args, i), 0);
+	      // Value *Var = B.CreateLoad(GEP(B, Args, i));
+	      Value *Var = LoadField(B, GEP(B, GEP(B, Args, i), ObjDepBuilder::instance), ObjInstanceBuilder::version);
+	      // Increment reference counter of object version. Only necessary
+	      // in concurrent operation, so we do it as part of issue.
+	      B.CreateCall(CILKRTS_FUNC(obj_version_add_ref, CGF), Var);
 	      Value *Meta = GEP(B, Var, ObjVersionBuilder::meta);
 	      // struct.__cilkrts_obj_metadata != __cilkrts_obj_metadata
 	      Value *CMeta = B.CreatePointerCast(Meta, (++WrFn->arg_begin())->getType());
@@ -2569,19 +2807,30 @@ CreateReleaseFn(CodeGenFunction &CGF,
   // Value *Tags = GEP(B, S, 1);
 
   // Call __cilkrts_obj_metadata_wakeup for every dataflow argument
+  // TODO: this should not be done under writer lock while move_to_ready_list
+  //       below must execute under writer lock
   Function * WakeFn = CILKRTS_FUNC(obj_metadata_wakeup, CGF);
   unsigned i=0;
   for( CallExpr::const_arg_iterator I=ArgBeg, E=ArgEnd; I != E; ++I ) {
       const clang::Type * type = I->getType().getTypePtr();
       if( IsDataflowType( type ) ) {
-	  Value *Var = LoadField(B, GEP(B, Args, i), 0);
+	  Value *VarPtr = GEP(B, GEP(B, Args, i), ObjDepBuilder::instance);
+	  Value *Var = LoadField(B, VarPtr, ObjInstanceBuilder::version);
 	  Value *Meta = GEP(B, Var, ObjVersionBuilder::meta);
 	  // struct.__cilkrts_obj_metadata != __cilkrts_obj_metadata
-	  Value *CMeta = B.CreatePointerCast(Meta, (++WakeFn->arg_begin())->getType());
+	  Value *CMeta = Meta; // B.CreatePointerCast(Meta, (++WakeFn->arg_begin())->getType());
 	  // TODO: This call could be slightly more efficient if we knew it was
 	  // read or write because with write you know that the generation
 	  // (should) drop empty.
 	  B.CreateCall2(WakeFn, RList, CMeta);
+	  // We are done with this object version. Decrement reference counter.
+	  // TODO: Could we move del_ref and destroy into WakeFn in order not
+	  //       to expose the payload to the ABI?
+	  B.CreateCall(CILKRTS_FUNC(obj_version_del_ref, CGF), Var);
+	  // Store a zero for safety
+	  StoreField(B, ConstantPointerNull::get(
+			 llvm::PointerType::getUnqual(Var->getType())),
+		     VarPtr, ObjInstanceBuilder::version);
 	  ++i;
       }
   }
@@ -2976,14 +3225,24 @@ ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
 	// All things requiring an alloca need to be saved in order to
 	// execute the call at a later stage, from a different caller.
 	llvm::PointerType *PTy = cast<llvm::PointerType>(Alloca->getType());
-	SavedStateTypes.push_back( PTy->getContainedType(0) );
 	ReplaceValues[Alloca] = CGCilkDataflowSpawnInfo::RemapInfo(field);
 
 	if( Arg != ArgEnd ) {
-	    if( IsDataflowType( Arg->getType().getTypePtr() ) )
+	    if( IsDataflowType( Arg->getType().getTypePtr() ) ) {
 		TagTypes.push_back( TaskListNodeBuilder::get(Ctx) );
+		SavedStateTypes.push_back( ObjDepBuilder::get(Ctx) );
+	    } else
+		SavedStateTypes.push_back( PTy->getContainedType(0) );
 	    ++Arg;
-	}
+	} else
+	    SavedStateTypes.push_back( PTy->getContainedType(0) );
+    }
+
+    llvm::errs() << "CGF === Args types:\n";
+    for( std::vector<llvm::Type *>::const_iterator
+	     I=SavedStateTypes.begin(), E=SavedStateTypes.end(); I != E; ++I ) {
+	(*I)->dump();
+	llvm::errs() << "\n";
     }
 
     // All other arguments to the function call must be saved in the
@@ -3097,7 +3356,15 @@ ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
 }
 
 static void
-ReplaceAllReachableUses(std::set<BasicBlock *> &BBs, Value *Arg, Value *New) {
+ReplaceAllReachableUses(std::set<BasicBlock *> &BBs, Value *Arg, Instruction *New) {
+    // TODO: make sure we cast only between internal and external dataflow types
+    if( Arg->getType() != New->getType() ) {
+	BasicBlock::iterator It(New);
+	++It;
+	New = llvm::CastInst::CreatePointerCast(New, Arg->getType(),
+						"replace_cast", It);
+    }
+
     for( Value::use_iterator I=Arg->use_begin(), E=Arg->use_end();
 	I != E; ) {
 	Use &U = I.getUse();
@@ -3183,7 +3450,11 @@ RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
 		B1.CreateConstInBoundsGEP2_32(ArgsSave, 0, SavedStateArgStart+i);
 	    B1.CreateStore(Arg, GEP1);
 
-	    llvm::Value *RL2 = LoadField(B2, ArgsReload, SavedStateArgStart+i);
+	    llvm::LoadInst *RL2 = LoadField(B2, ArgsReload, SavedStateArgStart+i);
+	    // TODO: There is an issue here (12/11/2015) as the object/dep
+	    // is currently defined to inherit from obj_instance, which implies
+	    // a second GEP due to inheritance, while the ArgsState contains
+	    // just the obj_instance* and requires 1 GEP.
 	    ReplaceAllReachableUses(ReachableBBs, Arg, RL2);
 	}
     }
@@ -3356,6 +3627,7 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
     {
 	CGBuilderTy &B = CGF.Builder;
 	B.CreateStore(SF1, SFPtr);
+// TODO: Is this one of the issues: IniReady is not always called; if not it means we do not store values in args_tags and we cannot issue? -- does not appear so..
 	llvm::Function *ReadyFn = CreateIniReadyFn(CGF);
 	PF = CGF.Builder.CreateCall(ReadyFn, Info->getContextValue());
 	PF->setName(pending_frame_name);
