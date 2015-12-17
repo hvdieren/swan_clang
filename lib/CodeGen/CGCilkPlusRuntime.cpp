@@ -97,7 +97,7 @@ typedef void (*__cilk_abi_f64_t)(void *data, cilk64_t low, cilk64_t high);
 
 typedef void (__cilkrts_enter_frame)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_enter_frame_1)(__cilkrts_stack_frame *sf);
-typedef void (__cilkrts_enter_frame_df)(__cilkrts_stack_frame *sf);
+typedef void (__cilkrts_enter_frame_df)(__cilkrts_stack_frame *sf); // TODO: unused
 typedef void (__cilkrts_enter_frame_fast)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_enter_frame_fast_1)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_enter_frame_fast_df)(__cilkrts_stack_frame *sf);
@@ -107,6 +107,7 @@ typedef void (__cilkrts_return_exception)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_rethrow)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_detach)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_pop_frame)(__cilkrts_stack_frame *sf);
+typedef void (__cilkrts_pop_frame_df)(__cilkrts_stack_frame *sf, void (*release_fn)(void*));
 typedef __cilkrts_worker *(__cilkrts_get_tls_worker)();
 typedef __cilkrts_worker *(__cilkrts_get_tls_worker_fast)();
 typedef __cilkrts_worker *(__cilkrts_bind_thread_1)();
@@ -722,6 +723,107 @@ static Function *Get__cilkrts_pop_frame(CodeGenFunction &CGF) {
   return Fn;
 }
 
+/// \brief Get or create a LLVM function for __cilkrts_pop_frame_df.
+/// It is equivalent to the following C code
+///
+/// __cilkrts_pop_frame_df(__cilkrts_stack_frame *sf,
+///                        void (*release_fn)(void*)) {
+///   sf->worker->current_stack_frame = sf->call_parent;
+///   sf->call_parent = 0;
+///
+///   bool do_release = false;
+///   if(sf->flags & CILK_FRAME_DATAFLOW_ISSUED)
+///      do_release = true;
+///   else {
+///      __cilkrts_stack_frame *parent = sf->worker->current_stack_frame;
+///      __cilkrts_stack_frame *to_issue;
+///      to_issue = CAS(&parent->df_issue_child, sf, 0);
+///      do_release = to_issue != sf;
+///   }
+///   if(do_release)
+///      __cilkrts_df_spawn_helper_release_fn(sf->args_tags);
+/// }
+static Function *Get__cilkrts_pop_frame_df(CodeGenFunction &CGF) {
+  Function *Fn = 0;
+
+  if (GetOrCreateFunction<__cilkrts_pop_frame_df>(
+	  "__cilkrts_pop_frame_df", CGF, Fn))
+    return Fn;
+
+  // If we get here we need to add the function body
+  LLVMContext &Ctx = CGF.getLLVMContext();
+
+  Value *SF = Fn->arg_begin();
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+  BasicBlock *CAS = BasicBlock::Create(Ctx, "cas", Fn);
+  BasicBlock *Release = BasicBlock::Create(Ctx, "release", Fn);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
+
+  // Entry
+  Value *Parent = 0;
+  {
+      CGBuilderTy B(Entry);
+
+      // sf->worker->current_stack_frame = sf->call_parent;
+      Parent = LoadField(B, SF, StackFrameBuilder::call_parent);
+      StoreField(B, Parent, LoadField(B, SF, StackFrameBuilder::worker),
+		 WorkerBuilder::current_stack_frame);
+
+      // sf->call_parent = 0;
+      StoreField(B,
+		 Constant::getNullValue(TypeBuilder<__cilkrts_stack_frame*, false>::get(Ctx)),
+		 SF, StackFrameBuilder::call_parent);
+
+      // if(sf->flags & CILK_FRAME_DATAFLOW_ISSUED)
+      Value *Flags = LoadField(B, SF, StackFrameBuilder::flags);
+      Value *DF_Issued =
+	  ConstantInt::get(Flags->getType(), CILK_FRAME_DATAFLOW_ISSUED);
+      Value *And = B.CreateAnd(Flags, DF_Issued);
+      Value *Cmp = B.CreateICmpNE(And, ConstantInt::get(And->getType(), 0));
+      B.CreateCondBr(Cmp, Release, CAS);
+  }
+
+  // CAS
+  {
+      CGBuilderTy B(CAS);
+
+      // __cilkrts_stack_frame *parent = ...
+      // __cilkrts_stack_frame *to_issue;
+      // to_issue = CAS(&parent->df_issue_child, sf, 0);
+      Value *DFIC = GEP(B, Parent, StackFrameBuilder::df_issue_child);
+      // Value *DFICVal = B.CreateLoad(DFIC);
+      Value *DFICVal = SF;
+      Value *NewVal = ConstantPointerNull::get(
+	  cast<llvm::PointerType>(DFICVal->getType()));
+      Value *ToIssue
+	  = B.CreateAtomicCmpXchg(DFIC, DFICVal, NewVal,
+				  llvm::SequentiallyConsistent);
+      // do_release = to_issue != sf;
+      Value *Cmp = B.CreateICmpNE(ToIssue, SF);
+      B.CreateCondBr(Cmp, Release, Exit);
+  }
+
+  // Release
+  {
+      CGBuilderTy B(Release);
+      Value *ReleaseFn = ++Fn->arg_begin(); // 2nd argument
+      B.CreateCall(ReleaseFn, LoadField(B, SF, StackFrameBuilder::args_tags));
+      B.CreateBr(Exit);
+  }
+
+  // Exit
+  {
+      CGBuilderTy B(Exit);
+      B.CreateRetVoid();
+  }
+
+  Fn->addFnAttr(Attribute::InlineHint);
+
+  return Fn;
+}
+
+
 /// \brief Get or create a LLVM function for __cilkrts_detach.
 /// It is equivalent to the following C code
 ///
@@ -1173,6 +1275,7 @@ static Function *Get__cilkrts_enter_frame_1(CodeGenFunction &CGF) {
   return Fn;
 }
 
+#if 0
 /// \brief Get or create a LLVM function for __cilkrts_enter_frame_df.
 /// It is equivalent to the following C code
 ///
@@ -1277,6 +1380,7 @@ static Function *Get__cilkrts_enter_frame_df(CodeGenFunction &CGF) {
 
   return Fn;
 }
+#endif
 
 
 /// \brief Get or create a LLVM function for __cilkrts_enter_frame_fast.
@@ -1395,7 +1499,6 @@ static Function *GetCilkParentPrologue(CodeGenFunction &CGF) {
 
   // __cilkrts_enter_frame_1(sf)
   B.CreateCall(CILKRTS_FUNC(enter_frame_1, CGF), SF);
-// TODO: DataflowParentPrologue calls enter_frame_df
 
   B.CreateRetVoid();
 
@@ -1639,21 +1742,11 @@ static llvm::Function *GetCilkHelperEpilogue(CodeGenFunction &CGF) {
 /// \brief Get or create a LLVM function for __cilk_dataflow_helper_epilogue.
 /// It is equivalent to the following C code
 ///
-/// void __cilk_dataflow_helper_epilogue(__cilkrts_stack_frame *sf) {
+/// void __cilk_dataflow_helper_epilogue(__cilkrts_stack_frame *sf,
+///                                      void (*rel_fn)(void *)) {
 ///   Probably sf->worker != 0 means full frame...
 ///   if (sf->worker) {
-///     __cilkrts_pop_frame(sf);
-///     bool do_release = false;
-///     if(sf->flags & CILK_FRAME_DATAFLOW_ISSUED)
-///        do_release = true;
-///     else {
-///        __cilkrts_stack_frame *parent = sf->worker->current_stack_frame;
-///        __cilkrts_stack_frame *to_issue;
-///        to_issue = CAS(&parent->df_issue_child, sf, 0);
-///        do_release = to_issue != sf;
-///     }
-///     if(do_release)
-///        __cilkrts_df_spawn_helper_release_fn(sf->args_tags);
+///     __cilkrts_pop_frame_df(sf,rel_fn);
 ///     __cilkrts_leave_frame(sf);
 ///   }
 /// }
@@ -1661,12 +1754,10 @@ static llvm::Function *
 GetCilkDataflowHelperEpilogue(CodeGenFunction &CGF) {
   Function *Fn = 0;
 
-  if (GetOrCreateFunction<cilk_func>("__cilk_dataflow_helper_epilogue", CGF, Fn))
-    return Fn;
-
-  CodeGenFunction::CGCilkDataflowSpawnInfo *Info =
-      dyn_cast<CodeGenFunction::CGCilkDataflowSpawnInfo>(CGF.CapturedStmtInfo);
-  llvm::Function *ReleaseFn = Info->getReleaseFn();
+    // Signature is like pop_frame_df
+    if (GetOrCreateFunction<__cilkrts_pop_frame_df>(
+	    "__cilk_dataflow_helper_epilogue", CGF, Fn))
+	return Fn;
 
   // If we get here we need to add the function body
   LLVMContext &Ctx = CGF.getLLVMContext();
@@ -1674,93 +1765,36 @@ GetCilkDataflowHelperEpilogue(CodeGenFunction &CGF) {
   Value *SF = Fn->arg_begin();
 
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
-  BasicBlock *PopBlock = BasicBlock::Create(Ctx, "pop_block", Fn);
-  BasicBlock *ChkBlock = BasicBlock::Create(Ctx, "chk_block", Fn);
-  BasicBlock *ReleaseBlock = BasicBlock::Create(Ctx, "release_block", Fn);
-  BasicBlock *LeaveBlock = BasicBlock::Create(Ctx, "leave_block", Fn);
+  BasicBlock *Body = BasicBlock::Create(Ctx, "body", Fn);
   BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
 
   // Entry
-  Value *Worker = 0;
   {
     CGBuilderTy B(Entry);
 
     // if (sf->worker)
-    Worker = LoadField(B, SF, StackFrameBuilder::worker);
-    Value *C = B.CreateIsNotNull(Worker);
-    B.CreateCondBr(C, PopBlock, Exit);
+    Value *C = B.CreateIsNotNull(LoadField(B, SF, StackFrameBuilder::worker));
+    B.CreateCondBr(C, Body, Exit);
   }
 
-  // PopBlock
+  // Body
   {
-    CGBuilderTy B(PopBlock);
+    CGBuilderTy B(Body);
 
-    // __cilkrts_pop_frame(sf);
-    B.CreateCall(CILKRTS_FUNC(pop_frame, CGF), SF);
+    // __cilkrts_pop_frame_df(sf, release_fn);
+    Value *ReleaseFn = ++Fn->arg_begin();
+    B.CreateCall2(CILKRTS_FUNC(pop_frame_df, CGF), SF, ReleaseFn);
 
-    ///     if(sf->flags & CILK_FRAME_DATAFLOW_ISSUED)
-    Value *Flags = LoadField(B, SF, StackFrameBuilder::flags);
-    Value *DF_Issued =
-	ConstantInt::get(Flags->getType(), CILK_FRAME_DATAFLOW_ISSUED);
-    Value *And = B.CreateAnd(Flags, DF_Issued);
-    Value *Cmp = B.CreateICmpNE(And, ConstantInt::get(And->getType(), 0));
-    B.CreateCondBr(Cmp, ReleaseBlock, ChkBlock);
-  }
+    // __cilkrts_leave_frame(sf);
+    B.CreateCall(CILKRTS_FUNC(leave_frame, CGF), SF);
 
-  // ChkBlock
-  {
-    CGBuilderTy B(ChkBlock);
-
-    ///        __cilkrts_stack_frame *parent = sf->worker->current_stack_frame;
-    ///        __cilkrts_stack_frame *to_issue;
-    ///        to_issue = CAS(&parent->df_issue_child, sf, 0);
-    ///        do_release = to_issue != sf;
-    Value *Parent = LoadField(B, Worker, WorkerBuilder::current_stack_frame);
-    Value *DFIC = GEP(B, Parent, StackFrameBuilder::df_issue_child);
-    Value *DFICVal = B.CreateLoad(DFIC);
-    Value *NewVal = ConstantPointerNull::get(
-	cast<llvm::PointerType>(DFICVal->getType()));
-// TODO: The CAS is executed for every non-issued dataflow stack frame
-//  This is expensive. Better may be to CAS only if popping the top-level
-//  frame. This means: leave_frame calls into the runtime.
-// Options/thoughts:
-//   + Extend leave_frame to call release_fn
-//   + Perform the check on the CAS-ed field inside the runtime, i.e., inside
-//     leave_frame, while holding a lock on the worker. Holding a lock would
-//     make it unnecessary to CAS as the thief is executing the issue_fn while
-//     holding a lock on the worker (for stealing purposes).
-//   + Anyway, CAS only when popping last frame (check flags?) would be helpful
-//     to avoid overheads.
-    Value *ToIssue
-	= B.CreateAtomicCmpXchg(DFIC, DFICVal, NewVal,
-				llvm::SequentiallyConsistent);
-    Value *Cmp = B.CreateICmpNE(ToIssue, SF);
-    B.CreateCondBr(Cmp, ReleaseBlock, LeaveBlock);
-  }
-
-  // ReleaseBlock
-  {
-      CGBuilderTy B(ReleaseBlock);
-
-      // release
-      B.CreateCall(ReleaseFn, LoadField(B, SF, StackFrameBuilder::args_tags));
-
-      B.CreateBr(LeaveBlock);
-  }
-
-
-  // LeaveBlock
-  {
-      CGBuilderTy B(LeaveBlock);
-      // __cilkrts_leave_frame(sf);
-      B.CreateCall(CILKRTS_FUNC(leave_frame, CGF), SF);
-      B.CreateBr(Exit);
+    B.CreateBr(Exit);
   }
 
   // Exit
   {
-      CGBuilderTy B(Exit);
-      B.CreateRetVoid();
+    CGBuilderTy B(Exit);
+    B.CreateRetVoid();
   }
 
   Fn->addFnAttr(Attribute::InlineHint);
@@ -2125,7 +2159,7 @@ Get__cilkrts_obj_version_del_ref(CodeGenFunction &CGF) {
 
 // TODO: create specialized version to call when issueing executing task
 //       in this case we know what state metadata can be in.
-// TODO: "vectorize" calculation of pushg, joins
+// TODO: "vectorize" calculation of pushg, joins using regular registers
 static Function *
 Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
   Function *Fn = 0;
@@ -2408,10 +2442,7 @@ CreateCallFn(CodeGenFunction &CGF, llvm::Function * HelperF) {
     Args.push_back(B.CreateBitCast(CallFn->arg_begin(), PFVTy));
     // Final argument: helper_flag
     Args.push_back(ConstantInt::get(Int1Ty, 1));
-
     B.CreateCall(HelperF, Args);
-
-    // TODO: Call release function -- in exception path?
     B.CreateRetVoid();
 
     return CallFn;
@@ -2459,7 +2490,6 @@ CreateHelperFn(CodeGenFunction &CGF, llvm::Function * MultiF) {
     Args.push_back(ConstantInt::get(Int1Ty, 0));
 
     B.CreateCall(MultiF, Args);
-    // TODO: Call release function -- in exception path?
     B.CreateRetVoid();
 
     return HelperFn;
@@ -2594,17 +2624,7 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
 	      Value *Version = B.CreatePointerCast(
 		  VersionRef,
 		  llvm::PointerType::getUnqual(ObjVersionBuilder::get(Ctx)));
-/*
-	      Value *ObjVersionPtr = B.CreatePointerCast(
-		  VersionedRef,
-		  llvm::PointerType::getUnqual(ObjVersionBuilder::get(Ctx)));
-*/
-	      // Value *Version = LoadField(B, ObjVersionPtr, VersionedBuilder::version);
-	      // Value *Version = LoadField(B, VersionedRef, ObjInstanceBuilder::version);
-	      // Value *Version = VersionedRef;
 	      StoreField(B, Version, GEP(B, GEP(B, Args, i), ObjDepBuilder::instance), ObjInstanceBuilder::version);
-
-	      // TODO: check that stores happen correctly
 	  }
       }
 
@@ -3401,6 +3421,7 @@ CodeGenFunction::
 RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
 		      llvm::Function *HelperFn) {
     // const CGFunctionInfo &CallInfo = *Info->getCallInfo();
+    // TODO: In case of spawn of void function, RV is NULL.
     RValue RV = Info->getRValue();
 
     CGCilkDataflowSpawnInfo::ARMapTy &ReplaceValues = Info->getReplaceValues();
@@ -3509,9 +3530,12 @@ public:
     }
 
     // __cilk_helper_epilogue(sf);
-    if(df)
-	CGF.Builder.CreateCall(GetCilkDataflowHelperEpilogue(CGF), SF);
-    else
+    if(df) {
+	CodeGenFunction::CGCilkDataflowSpawnInfo *Info
+	    = dyn_cast<CodeGenFunction::CGCilkDataflowSpawnInfo>(CGF.CapturedStmtInfo);
+	CGF.Builder.CreateCall2(GetCilkDataflowHelperEpilogue(CGF), SF,
+				Info->getReleaseFn());
+    } else
 	CGF.Builder.CreateCall(GetCilkHelperEpilogue(CGF), SF);
   }
 };
@@ -3627,7 +3651,6 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
     {
 	CGBuilderTy &B = CGF.Builder;
 	B.CreateStore(SF1, SFPtr);
-// TODO: Is this one of the issues: IniReady is not always called; if not it means we do not store values in args_tags and we cannot issue? -- does not appear so..
 	llvm::Function *ReadyFn = CreateIniReadyFn(CGF);
 	PF = CGF.Builder.CreateCall(ReadyFn, Info->getContextValue());
 	PF->setName(pending_frame_name);
@@ -3756,10 +3779,6 @@ void CGCilkPlusRuntime::
 EmitCilkHelperDataFlowPrologue(CodeGenFunction &CGF,
 			       const CGFunctionInfo &CallInfo,
 			       SmallVector<llvm::Value *, 16> & Args) {
-    CodeGenFunction::CGCilkDataflowSpawnInfo *Info =
-	dyn_cast<CodeGenFunction::CGCilkDataflowSpawnInfo>(CGF.CapturedStmtInfo);
-    assert(Info);
-
     EmitCilkHelperPrologue(CGF); // Just as a place holder to see where this goes
 }
 
