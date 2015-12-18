@@ -511,101 +511,93 @@ public:
 
   class CGCilkDataflowSpawnInfo : public CGCilkSpawnInfo {
   public:
-    struct RemapInfo {
-      llvm::GetElementPtrInst *GEP;
-      unsigned field;
+      struct RemapInfo {
+	  llvm::GetElementPtrInst *GEP;
+	  unsigned field;
+	
+	  RemapInfo(unsigned f=0) : GEP(0), field(f) { }
+      };
+      typedef std::map<llvm::Value *, RemapInfo> ARMapTy;
 
-      RemapInfo(unsigned f=0) : GEP(0), field(f) { }
-    };
-    typedef std::map<llvm::Value *, RemapInfo> ARMapTy;
+      explicit CGCilkDataflowSpawnInfo(const CapturedStmt &S, VarDecl *VD,
+				       RecordDecl *RD)
+	  : CGCilkSpawnInfo(S, VD, CR_CilkDataflowSpawn), // DataflowState(RD) { }
+	    SavedStateTy(0), SavedState(0), SavedStateArgStart(0), ReloadBB(0),
+	    SaveBB(0), IniReadyFn(0), IssueFn(0), ReleaseFn(0) { }
 
-    explicit CGCilkDataflowSpawnInfo(const CapturedStmt &S, VarDecl *VD,
-				     RecordDecl *RD)
-	: CGCilkSpawnInfo(S, VD, CR_CilkDataflowSpawn), // DataflowState(RD) { }
-	  SavedStateTy(0), SavedState(0), SavedStateArgStart(0), ReloadBB(0),
-	  SaveBB(0), IniReadyFn(0), IssueFn(0), ReleaseFn(0) { }
+      virtual StringRef getHelperName() const { return "__cilk_df_spawn_helper_multi"; }
 
-      // virtual void EmitBody(CodeGenFunction &CGF, Stmt *S);
-    virtual StringRef getHelperName() const { return "__cilk_df_spawn_helper_multi"; }
-
-    bool isDataflowSpawn() const { return true; }
-    RecordDecl *getDataflowState() const { return 0; } // DataflowState; }
+      bool isDataflowSpawn() const { return true; }
+      RecordDecl *getDataflowState() const { return 0; } // DataflowState; }
 
       void setDataflowAddress(llvm::Value *val) { } // DataflowAddr = val; }
       llvm::Value *getDataflowAddress() const { return 0; } // DataflowAddr; }
 
-    void recordAllocaInsertPt(llvm::Instruction * Pt) {
-	SavedAllocaInsertPt = --llvm::BasicBlock::iterator(Pt);
-    }
-    llvm::BasicBlock::iterator getSavedAllocaInsertPt() const {
-	return SavedAllocaInsertPt;
-    }
-
-    llvm::StructType *getSavedStateTy() const { return SavedStateTy; }
-    llvm::AllocaInst *getSavedState() const { return SavedState; }
-    unsigned getSavedStateArgStart() const { return SavedStateArgStart; }
-
-    void setIssueFn(llvm::Function *IRFn) { IssueFn = IRFn; }
-    llvm::Function *getIssueFn() const { return IssueFn; }
-
-    void setReleaseFn(llvm::Function *IRFn) { ReleaseFn = IRFn; }
-    llvm::Function *getReleaseFn() const { return ReleaseFn; }
-
-    void setIniReadyFn(llvm::Function *IRFn) { IniReadyFn = IRFn; }
-    llvm::Function *getIniReadyFn() const { return IniReadyFn; }
-
-    void setSavedState(llvm::StructType *STy, llvm::AllocaInst *S,
-		       unsigned Start) {
-	SavedStateTy = STy;
-	SavedState = S;
-	SavedStateArgStart = Start;
-    }
-    void setReloadBB(llvm::BasicBlock *rBB) { ReloadBB=rBB; }
-    llvm::BasicBlock *getReloadBB() const { return ReloadBB; }
-
-    void setSaveBB(llvm::BasicBlock *rBB) { SaveBB=rBB; }
-    llvm::BasicBlock *getSaveBB() const { return SaveBB; }
-
-      // llvm::FunctionType * getFunctionType() const { return FnTy; };
-      // void setFunctionType(llvm::FunctionType *FT) { FnTy = FT; };
-
-    ARMapTy &getReplaceValues() { return ReplaceValues; }
-
-      RValue getRValue() const { return RV; }
-      const CGFunctionInfo *getCallInfo() const { return CallInfo; }
-
-      void recordRValue(const CGFunctionInfo * I, RValue RVal) {
-	  CallInfo = I;
-	  RV = RVal;
+      void recordAllocaInsertPt(llvm::Instruction * Pt) {
+	  SavedAllocaInsertPt = --llvm::BasicBlock::iterator(Pt);
+      }
+      llvm::BasicBlock::iterator getSavedAllocaInsertPt() const {
+	  return SavedAllocaInsertPt;
       }
 
-    static bool classof(const CGCilkSpawnInfo *) { return true; }
-    static bool classof(const CGCilkDataflowSpawnInfo *) { return true; }
-    static bool classof(const CGCapturedStmtInfo *I) {
-      return I->getKind() == CR_CilkDataflowSpawn;
-    }
+      llvm::StructType *getSavedStateTy() const { return SavedStateTy; }
+      llvm::AllocaInst *getSavedState() const { return SavedState; }
+      unsigned getSavedStateArgStart() const { return SavedStateArgStart; }
+      
+      void setIssueFn(llvm::Function *IRFn) { IssueFn = IRFn; }
+      llvm::Function *getIssueFn() const { return IssueFn; }
+
+      void setReleaseFn(llvm::Function *IRFn) { ReleaseFn = IRFn; }
+    llvm::Function *getReleaseFn() const { return ReleaseFn; }
+
+      void setIniReadyFn(llvm::Function *IRFn) { IniReadyFn = IRFn; }
+      llvm::Function *getIniReadyFn() const { return IniReadyFn; }
+      
+      void setSavedState(llvm::StructType *STy, llvm::AllocaInst *S,
+			 unsigned Start) {
+	  SavedStateTy = STy;
+	  SavedState = S;
+	  SavedStateArgStart = Start;
+      }
+
+      void setReloadBB(llvm::BasicBlock *rBB) { ReloadBB=rBB; }
+      llvm::BasicBlock *getReloadBB() const { return ReloadBB; }
+      void setSaveBB(llvm::BasicBlock *rBB) { SaveBB=rBB; }
+      llvm::BasicBlock *getSaveBB() const { return SaveBB; }
+
+      ARMapTy &getReplaceValues() { return ReplaceValues; }
+
+      llvm::Instruction *getCallInst() const { return CallInst; }
+
+      void recordCallInst(llvm::Instruction *CI_) {
+	  CallInst = CI_;
+      }
+
+      static bool classof(const CGCilkSpawnInfo *) { return true; }
+      static bool classof(const CGCilkDataflowSpawnInfo *) { return true; }
+      static bool classof(const CGCapturedStmtInfo *I) {
+	  return I->getKind() == CR_CilkDataflowSpawn;
+      }
   private:
-    /// \brief Record definition of dataflow arguments or null?
-    // RecordDecl *DataflowState;
+      /// \brief Record definition of dataflow arguments or null?
+      // RecordDecl *DataflowState;
 
-    /// \brief The address the above record for this function.
-    // llvm::Value *DataflowAddr;
+      /// \brief The address the above record for this function.
+      // llvm::Value *DataflowAddr;
 
-    /// \brief Saved AllocaInsertPt prior to emitting call args
-    llvm::BasicBlock::iterator SavedAllocaInsertPt;
+      /// \brief Saved AllocaInsertPt prior to emitting call args
+      llvm::BasicBlock::iterator SavedAllocaInsertPt;
 
-    llvm::StructType *SavedStateTy;
-    llvm::AllocaInst *SavedState;
-    unsigned SavedStateArgStart;
-    ARMapTy ReplaceValues;
-      // llvm::FunctionType *FnTy;
-    llvm::BasicBlock *ReloadBB;
-    llvm::BasicBlock *SaveBB;
-    llvm::Function *IniReadyFn;
-    llvm::Function *IssueFn;
-    llvm::Function *ReleaseFn;
-      RValue RV;
-      const CGFunctionInfo * CallInfo;
+      llvm::StructType *SavedStateTy;
+      llvm::AllocaInst *SavedState;
+      unsigned SavedStateArgStart;
+      ARMapTy ReplaceValues;
+      llvm::BasicBlock *ReloadBB;
+      llvm::BasicBlock *SaveBB;
+      llvm::Function *IniReadyFn;
+      llvm::Function *IssueFn;
+      llvm::Function *ReleaseFn;
+      llvm::Instruction *CallInst;
   };
 
 

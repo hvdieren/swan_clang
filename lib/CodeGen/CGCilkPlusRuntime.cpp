@@ -3420,10 +3420,6 @@ void
 CodeGenFunction::
 RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
 		      llvm::Function *HelperFn) {
-    // const CGFunctionInfo &CallInfo = *Info->getCallInfo();
-    // TODO: In case of spawn of void function, RV is NULL.
-    RValue RV = Info->getRValue();
-
     CGCilkDataflowSpawnInfo::ARMapTy &ReplaceValues = Info->getReplaceValues();
     for( CGCilkDataflowSpawnInfo::ARMapTy::iterator I=ReplaceValues.begin(),
 	     E=ReplaceValues.end(); I != E; ++I ) {
@@ -3433,7 +3429,7 @@ RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
     }
 
     unsigned NumArgs = 0;
-    llvm::Instruction * RVInst = dyn_cast<llvm::Instruction>(RV.getScalarVal());
+    llvm::Instruction *RVInst = Info->getCallInst();
     assert(RVInst);
     if( llvm::CallInst * TheCall = dyn_cast<llvm::CallInst>(RVInst) )
 	NumArgs = TheCall->getNumArgOperands();

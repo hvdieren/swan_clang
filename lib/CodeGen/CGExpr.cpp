@@ -3275,18 +3275,8 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType, llvm::Value *Callee,
     Callee = Builder.CreateBitCast(Callee, CalleeTy, "callee.knr.cast");
   }
 
-  RValue RV = EmitCall(FnInfo, Callee, ReturnValue, Args, TargetDecl,
-		       /*callOrInvoke=*/0, IsCilkSpawnCall);
-
-  if( IsCilkSpawnCall && CapturedStmtInfo ) {
-      if( CGCilkDataflowSpawnInfo * Info
-	  = dyn_cast<CGCilkDataflowSpawnInfo>(CapturedStmtInfo) )
-	  // RewriteHelperFunction(FnInfo, RV);
-	  Info->recordRValue(&FnInfo, RV);
-	  
-  }
-
-  return RV;
+  return EmitCall(FnInfo, Callee, ReturnValue, Args, TargetDecl,
+		  /*callOrInvoke=*/0, IsCilkSpawnCall);
 }
 
 LValue CodeGenFunction::

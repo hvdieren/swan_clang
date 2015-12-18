@@ -2558,6 +2558,13 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
   if (Builder.isNamePreserving() && !CI->getType()->isVoidTy())
     CI->setName("call");
 
+  // Record call site for rewriting Cilk dataflow helper
+  if (IsCilkSpawnCall && CapturedStmtInfo) {
+      if( CGCilkDataflowSpawnInfo * Info
+	  = dyn_cast<CGCilkDataflowSpawnInfo>(CapturedStmtInfo) )
+	  Info->recordCallInst(CI);
+  }
+
   // Emit any writebacks immediately.  Arguably this should happen
   // after any return-value munging.
   if (CallArgs.hasWritebacks())
