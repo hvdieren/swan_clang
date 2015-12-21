@@ -757,6 +757,7 @@ static Function *Get__cilkrts_pop_frame_df(CodeGenFunction &CGF) {
 
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
   BasicBlock *CAS = BasicBlock::Create(Ctx, "cas", Fn);
+  BasicBlock *ChkDone = BasicBlock::Create(Ctx, "chk_done", Fn);
   BasicBlock *Release = BasicBlock::Create(Ctx, "release", Fn);
   BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
 
@@ -776,15 +777,22 @@ static Function *Get__cilkrts_pop_frame_df(CodeGenFunction &CGF) {
 		 SF, StackFrameBuilder::call_parent);
 
       // if(sf->flags & CILK_FRAME_DATAFLOW_ISSUED)
+      // Would make sense to check flags & DATAFLOW: if not, exit immediately
+/*
       Value *Flags = LoadField(B, SF, StackFrameBuilder::flags);
       Value *DF_Issued =
 	  ConstantInt::get(Flags->getType(), CILK_FRAME_DATAFLOW_ISSUED);
       Value *And = B.CreateAnd(Flags, DF_Issued);
       Value *Cmp = B.CreateICmpNE(And, ConstantInt::get(And->getType(), 0));
+*/
+      Value *ParentZ = ConstantPointerNull::get(
+	  cast<llvm::PointerType>(Parent->getType()));
+      Value *Cmp = B.CreateICmpEQ(Parent, ParentZ);
       B.CreateCondBr(Cmp, Release, CAS);
   }
 
   // CAS
+  Value *NewVal;
   {
       CGBuilderTy B(CAS);
 
@@ -794,14 +802,32 @@ static Function *Get__cilkrts_pop_frame_df(CodeGenFunction &CGF) {
       Value *DFIC = GEP(B, Parent, StackFrameBuilder::df_issue_child);
       // Value *DFICVal = B.CreateLoad(DFIC);
       Value *DFICVal = SF;
-      Value *NewVal = ConstantPointerNull::get(
+      NewVal = ConstantPointerNull::get(
 	  cast<llvm::PointerType>(DFICVal->getType()));
       Value *ToIssue
 	  = B.CreateAtomicCmpXchg(DFIC, DFICVal, NewVal,
 				  llvm::SequentiallyConsistent);
       // do_release = to_issue != sf;
+      // to_issue can 0, 1 or sf
       Value *Cmp = B.CreateICmpNE(ToIssue, SF);
-      B.CreateCondBr(Cmp, Release, Exit);
+      B.CreateCondBr(Cmp, ChkDone, Exit);
+  }
+
+  // ChkDone - to_issue is 0 or 1
+  // Wait until issue has completed. We are about to leave our stack frame,
+  // which implies deallocating args_tags. Yet another thread is accessing
+  // args_tags, which causes a race condition. We need to wait for the other
+  // thread to finish before de-allocating (or proceeding with pop).
+  // The problem could be solved by dynamically allocating args_tags, but
+  // that would be slow in comparison to this solution as the waiting
+  // rarely occurs and is expected to be short.
+  {
+      CGBuilderTy B(ChkDone);
+      // TODO: make field volatile or insert memory barrier in light of
+      //       compiler optimizations
+      Value *ToIssue = LoadField(B, Parent, StackFrameBuilder::df_issue_child);
+      Value *Cmp = B.CreateICmpEQ(ToIssue, NewVal);
+      B.CreateCondBr(Cmp, ChkDone, Release);
   }
 
   // Release
@@ -1275,7 +1301,6 @@ static Function *Get__cilkrts_enter_frame_1(CodeGenFunction &CGF) {
   return Fn;
 }
 
-#if 0
 /// \brief Get or create a LLVM function for __cilkrts_enter_frame_df.
 /// It is equivalent to the following C code
 ///
@@ -1380,7 +1405,6 @@ static Function *Get__cilkrts_enter_frame_df(CodeGenFunction &CGF) {
 
   return Fn;
 }
-#endif
 
 
 /// \brief Get or create a LLVM function for __cilkrts_enter_frame_fast.
@@ -2553,6 +2577,11 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
       if( IsDataflowType( type ) ) {
 	  CGBuilderTy B(bb_ready);
 
+	  // TODO:
+	  // Recovering the value from the struct anon is hard because we
+	  // we do not know how it is presented, e.g., perhaps as a pointer to
+	  // the versioned object rather than the versioned object itself...
+
 	  // Emit a ready check and move the insertion point to the basic block
 	  // on the ready path, creating a new ready block.
 	  // EmitCilkHelperIniReadyArg(CGF, bb_ready, bb_not_ready, Args[i]);
@@ -2704,6 +2733,7 @@ CreateIssueFn(CodeGenFunction &CGF,
   {
       CGBuilderTy B(Entry);
 
+      // Issue function expects SVoid = ArgsTags argument.
       PF = Fn->arg_begin();
       Value *SVoid = ++Fn->arg_begin();
       // Value *ATVoid = LoadField(B, PF, PendingFrameBuilder::args_tags);
