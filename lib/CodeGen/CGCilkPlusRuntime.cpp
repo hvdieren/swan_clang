@@ -146,6 +146,7 @@ typedef void (__cilkrts_obj_version_destroy)(__cilkrts_obj_version *);
 typedef void (__cilkrts_move_to_ready_list)(
     __cilkrts_worker *, __cilkrts_ready_list *);
 typedef void (__cilkrts_detach_pending)(__cilkrts_pending_frame *sf);
+typedef __cilkrts_pending_frame * (__cilkrts_ini_ready_fn_ty)(void *);
 typedef void (__cilkrts_issue_fn_ty)(__cilkrts_pending_frame *, void *);
 typedef void (__cilkrts_release_fn_ty)(void *);
 typedef void (__cilkrts_df_helper_fn_ty)(__cilkrts_stack_frame *, char *,
@@ -172,6 +173,7 @@ DEFAULT_GET_CILKRTS_FUNC(bind_thread_1)
 DEFAULT_GET_CILKRTS_FUNC(pending_frame_create)
 DEFAULT_GET_CILKRTS_FUNC(detach_pending)
 DEFAULT_GET_CILKRTS_FUNC(obj_metadata_wakeup_hard)
+DEFAULT_GET_CILKRTS_FUNC(obj_metadata_add_task) // tmp
 DEFAULT_GET_CILKRTS_FUNC(obj_version_destroy)
 
 #define DEFAULT_GET_CILKRTS_ANON_FUNC(name) \
@@ -2133,7 +2135,7 @@ Get__cilkrts_obj_version_add_ref(CodeGenFunction &CGF) {
 /// It is equivalent to the following C code
 ///
 /// void __cilkrts_obj_version_del_ref( __cilkrts_obj_version *v ) {
-///    if( __sync_fetch_and_del( &v->refcnt, -1) == 1 )
+///    if( __sync_fetch_and_add( &v->refcnt, -1) == 1 )
 ///        __cilkrts_obj_version_destroy( v );
 /// }
 static Function *
@@ -2184,6 +2186,7 @@ Get__cilkrts_obj_version_del_ref(CodeGenFunction &CGF) {
 // TODO: create specialized version to call when issueing executing task
 //       in this case we know what state metadata can be in.
 // TODO: "vectorize" calculation of pushg, joins using regular registers
+#if 0
 static Function *
 Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
   Function *Fn = 0;
@@ -2316,6 +2319,7 @@ Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
 
     return Fn;
 }
+#endif
 
 static Function *
 Get__cilkrts_obj_metadata_add_task_read(CodeGenFunction &CGF) {
@@ -2529,21 +2533,14 @@ CreateIniReadyFn(CodeGenFunction &CGF) {
   const char * FnName = "__cilkrts_df_spawn_helper_ini_ready_fn";
 
   // Create the function. Type is:
-  // __cilkrts_pending_frame * ( struct anon * )
-  llvm::Type * params[] = {
-      CGF.CapturedStmtInfo->getContextValue()->getType() // ,
-      // llvm::Type::getInt32Ty(Ctx)
-  };
-  llvm::FunctionType *FTy = llvm::FunctionType::get(
-      TypeBuilder<__cilkrts_pending_frame *, false>::get(Ctx), params, false);
+  // __cilkrts_pending_frame * ( void * args_tags )
+  // Note: Info->getSavedStateTy()) not yet defined, still NULL pointer
+  llvm::FunctionType *FTy
+      = TypeBuilder<__cilkrts_ini_ready_fn_ty, false>::get(Ctx);
   llvm::Function * Fn
-      = Function::Create(FTy,
-			 llvm::GlobalValue::InternalLinkage,
-			 // llvm::GlobalValue::ExternalLinkage,
+      = Function::Create(FTy, llvm::GlobalValue::InternalLinkage,
 			 FnName, &CGF.CGM.getModule());
-
   Info->setIniReadyFn(Fn);
-
   return Fn;
 }
 
@@ -2561,13 +2558,18 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
   // Function arguments
   llvm::Type *Int32Ty = llvm::Type::getInt32Ty(Ctx);
   Function::arg_iterator I = Fn->arg_begin();
-  llvm::Argument *SavedState = I; // Captured state, not args_tags
+  llvm::Argument *ATVoid = I; // args_tags
 
   // Key basic blocks
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
   BasicBlock *bb_ready = BasicBlock::Create(Ctx, "check_arg0", Fn);
   BasicBlock *bb_not_ready = BasicBlock::Create(Ctx, "not_ready", Fn);
   BasicBlock *Unsynced = bb_ready;
+
+  llvm::PointerType *PtrToSavedStateTy =
+      llvm::PointerType::getUnqual(Info->getSavedStateTy());
+
+  llvm::Function *ObjIniReadyFn = CILKRTS_FUNC(obj_metadata_ini_ready, CGF);
 
   // Now we need to know which arguments are dataflow and emit a call to
   // __cilkrts_obj_metadata_ini_ready for them.
@@ -2577,40 +2579,27 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
       if( IsDataflowType( type ) ) {
 	  CGBuilderTy B(bb_ready);
 
-	  // TODO:
 	  // Recovering the value from the struct anon is hard because we
 	  // we do not know how it is presented, e.g., perhaps as a pointer to
-	  // the versioned object rather than the versioned object itself...
+	  // the versioned object rather than the versioned object itself.
+	  // This is why we first store the actual arguments to the function
+	  // call in the args_tags data structure before checking if all
+	  // arguments are ready. This incurs the (small?) cost of copying all
+	  // arguments to a dynamically allocated args_tags for the
+	  // pending_frame in case one is not ready.
 
-	  // Emit a ready check and move the insertion point to the basic block
-	  // on the ready path, creating a new ready block.
-	  // EmitCilkHelperIniReadyArg(CGF, bb_ready, bb_not_ready, Args[i]);
-	  // Value * Meta = CallArgs[i].RV.getScalarVal();
-	  Value *X = GEP(B, SavedState, i); // Type: %"class.cilk::versioned"**
-	  // Value *Y = GEP(B, X, ObjDepBuilder::instance);
-	  // Value *VersionedRef = LoadField(B, Y, ObjInstanceBuilder::version);
-	  Value *VersionedRefRef = B.CreateLoad(X);
-	  Value *ObjVersionPtr = B.CreatePointerCast(
-	      VersionedRefRef,
-	      llvm::PointerType::getUnqual(
-		  llvm::PointerType::getUnqual(ObjVersionBuilder::get(Ctx))));
-	  Value *Version = B.CreateLoad(ObjVersionPtr);
-/*
-	  Value *Version = LoadField(B, ObjVersionPtr, ObjInstanceBuilder::version);
-*/
+	  Value *AT = B.CreateBitCast(ATVoid, PtrToSavedStateTy);
+	  Value *Args = GEP(B, AT, 0);
+	  Value *Version
+	      = LoadField(B, GEP(B, GEP(B, Args, i), ObjDepBuilder::instance),
+			  ObjInstanceBuilder::version);
+
 	  Value *MetaRaw = GEP(B, Version, ObjVersionBuilder::meta);
 	  Value *Meta = MetaRaw;
-/* Redundant if mapped internally to __cilkrts_obj_instance
-	      = B.CreatePointerCast(MetaRaw,
-				    CILKRTS_FUNC(obj_metadata_ini_ready, CGF)
-				    ->arg_begin()->getType());
-*/
 	  Value *Group
 	      = ConstantInt::get(llvm::Type::getInt32Ty(Ctx),
 				 GetDataflowKind(type));
-	  Value *IReady
-	      = B.CreateCall2(CILKRTS_FUNC(obj_metadata_ini_ready, CGF), Meta, Group);
-
+	  Value *IReady = B.CreateCall2( ObjIniReadyFn, Meta, Group);
 	  Value *Cond = B.CreateICmpNE(IReady,
 				       ConstantInt::get(IReady->getType(), 0));
 	  bb_ready = BasicBlock::Create(Ctx, "check_arg1", Fn, bb_not_ready);
@@ -2637,25 +2626,11 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
       Value *PF
 	  = B.CreateCall(CILKRTS_FUNC(pending_frame_create, CGF), Size);
 
-      // Store arguments in args_tags
-      // TODO: this is redundant, handled in full by _multi function. Better to
-      //       postpone actual issue call (beware of races...)?
-      unsigned i=0;
-      Value *ATVoid = LoadField(B, PF, PendingFrameBuilder::args_tags);
-      Value *ArgsTags = B.CreateBitCast(ATVoid, llvm::PointerType::getUnqual(Info->getSavedStateTy()));
-      Value *Args = GEP(B, ArgsTags, 0);
-      for( CallExpr::const_arg_iterator I=ArgBeg, E=ArgEnd; I != E; ++I, ++i ) {
-	  const clang::Type * type = I->getType().getTypePtr();
-	  if( IsDataflowType( type ) ) {
-	      Value *X = GEP(B, SavedState, i);
-	      Value *VersionedRef = B.CreateLoad(X);
-	      Value *VersionRef = B.CreateLoad(VersionedRef);
-	      Value *Version = B.CreatePointerCast(
-		  VersionRef,
-		  llvm::PointerType::getUnqual(ObjVersionBuilder::get(Ctx)));
-	      StoreField(B, Version, GEP(B, GEP(B, Args, i), ObjDepBuilder::instance), ObjInstanceBuilder::version);
-	  }
-      }
+      // Copy args_tags from stack frame to pending frame
+      // TODO: memcpy could be faster if we knew it was aligned (twice).
+      //       PFAT is probably 8-byte aligned. Not sure for ATVoid.
+      Value *PFAT = LoadField(B, PF, PendingFrameBuilder::args_tags);
+      B.CreateMemCpy(PFAT, ATVoid, Size, false);
 
       // Store generated helper call_fn into state
       // pf->call_fn = &spawn_helper_call_fn;
@@ -2663,7 +2638,7 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
       StoreField(B, CallFn, PF, PendingFrameBuilder::call_fn);
 
       // spawn_helper_issue_fn( pf, s );
-      B.CreateCall2(Info->getIssueFn(), PF, ArgsTags);
+      B.CreateCall2(Info->getIssueFn(), PF, PFAT);
 
       // __cilkrts_detach_pending(pf);
       B.CreateCall(CILKRTS_FUNC(detach_pending, CGF), PF);
@@ -2715,6 +2690,7 @@ CreateIssueFn(CodeGenFunction &CGF,
 
   // Create the function. Type is:
   // __cilkrts_pending_frame * ( __cilkrts_pending_frame *, void * )
+// TODO: explicitly set the argument to issue function to args_tags * type.
   llvm::FunctionType *FTy = TypeBuilder<__cilkrts_issue_fn_ty, false>::get(Ctx);
   llvm::Function * Fn
       = Function::Create(FTy, llvm::GlobalValue::InternalLinkage,
@@ -2913,7 +2889,7 @@ GetDataflowTagType( ASTContext & Ctx, QualType qtype ) {
 
 static const char *stack_frame_name = "__cilkrts_sf";
 static const char *stack_frame_arg_name = "__cilkrts_sf_arg";
-static const char *stack_frame_pointer_name = "__cilkrst_sf_ptr";
+static const char *stack_frame_pointer_name = "__cilkrts_sf_ptr";
 static const char *pending_frame_name = "__cilkrts_pf";
 static const char *helper_flag_name = "__cilkrts_helper_flag";
 static const char *saved_state_name = "__cilkrts_saved_state";
@@ -3468,9 +3444,14 @@ RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
 
     BasicBlock * SaveBB = Info->getSaveBB();
 
-    CGBuilderTy B1(BasicBlock::iterator(SaveBB->getTerminator()));
+    // CGBuilderTy B1(BasicBlock::iterator(SaveBB->getTerminator()));
+    // LookupPendingFrame() returns the call to IniReadyFn() as this returns
+    // the pending frame.
+    
+    BasicBlock::iterator it(dyn_cast<llvm::Instruction>(LookupPendingFrame(*this)));
+    CGBuilderTy B1(it);
     CGBuilderTy B2(RVInst);
-    llvm::Value * SavedState = Info->getSavedState();
+    // llvm::Value * SavedState = Info->getSavedState();
     unsigned SavedStateArgStart = Info->getSavedStateArgStart();
 
     std::set<BasicBlock *> ReachableBBs;
@@ -3480,11 +3461,12 @@ RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
     // into the call function
     llvm::PointerType *SSPTy
 	= llvm::PointerType::getUnqual(Info->getSavedStateTy());
-    llvm::Value *SavedState1Void = B1.CreateLoad(SavedState);
-    llvm::Value *SavedState1 = B1.CreateBitCast(SavedState1Void, SSPTy);
+    llvm::Value *SavedState1 = LookupSavedState(*this);
     llvm::Value * ArgsSave =
 	B1.CreateConstInBoundsGEP2_32(SavedState1, 0, 0);
-    llvm::Value *SavedState2Void = B2.CreateLoad(SavedState);
+
+    llvm::Value * SavedState2Ptr = LookupSavedStatePtr(*this);
+    llvm::Value *SavedState2Void = B2.CreateLoad(SavedState2Ptr);
     llvm::Value *SavedState2 = B2.CreateBitCast(SavedState2Void, SSPTy);
     llvm::Value * ArgsReload =
 	B2.CreateConstInBoundsGEP2_32(SavedState2, 0, 0);
@@ -3498,10 +3480,6 @@ RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
 	    B1.CreateStore(Arg, GEP1);
 
 	    llvm::LoadInst *RL2 = LoadField(B2, ArgsReload, SavedStateArgStart+i);
-	    // TODO: There is an issue here (12/11/2015) as the object/dep
-	    // is currently defined to inherit from obj_instance, which implies
-	    // a second GEP due to inheritance, while the ArgsState contains
-	    // just the obj_instance* and requires 1 GEP.
 	    ReplaceAllReachableUses(ReachableBBs, Arg, RL2);
 	}
     }
@@ -3638,6 +3616,8 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
     ParentSynced->setName(parent_synced_name);
 
     // TODO: replace by PHINode
+    // TODO: this is only ever initialised to 0. What is it's use? Missing
+    //       correct initialisation? Extra store? Not necessary?
     CGF.Builder.CreateStore(ConstantInt::get(Int1Ty, 0), ParentSynced);
 
     // Check flag to see if we jump to reload_bb immediately or not
@@ -3645,16 +3625,19 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
 
     BasicBlock *CallFnBB = CGF.createBasicBlock("__cilk_call_fn.0");
     BasicBlock *ReloadBB = CGF.createBasicBlock("__cilk_reload");
-    BasicBlock *UnsyncBB = CGF.createBasicBlock("__cilk_unsync");
-    BasicBlock *ResetATBB = CGF.createBasicBlock("__cilk_reset_at");
     BasicBlock *SaveStateBB = CGF.createBasicBlock("__cilk_save_state");
     Info->setReloadBB(ReloadBB);
 
     // If flag is 1, initialize stack frame, then reload arguments from saved
     // state and call function.
-    Value *DoCall
-	= CGF.Builder.CreateICmpNE(Flag, ConstantInt::get(Flag->getType(), 0));
-    CGF.Builder.CreateCondBr(DoCall, CallFnBB, UnsyncBB);
+    {
+	CGBuilderTy &B = CGF.Builder;
+
+	B.CreateStore(LookupStackFrame(CGF), SFPtr);
+	Value *DoCall
+	    = B.CreateICmpNE(Flag, ConstantInt::get(Flag->getType(), 0));
+	B.CreateCondBr(DoCall, CallFnBB, SaveStateBB);
+    }
 	
     CGF.EmitBlock(CallFnBB);
     {
@@ -3663,36 +3646,16 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
 	// No need to initialize further, just use it.
 	// Get current saved state from stack_frame argument.
 	llvm::Type *SFTy = StackFrameBuilder::get(Ctx);
-	Value *SF2 = B.CreatePointerCast(LookupStackFrameArg(CGF),
-					 llvm::PointerType::getUnqual(SFTy));
-	B.CreateStore(SF2, SFPtr);
-	Value *AT = LoadField(B, SF2, StackFrameBuilder::args_tags);
+	Value *SFArg = B.CreatePointerCast(LookupStackFrameArg(CGF),
+					   llvm::PointerType::getUnqual(SFTy));
+	B.CreateStore(SFArg, SFPtr);
+	Value *AT = LoadField(B, SFArg, StackFrameBuilder::args_tags);
 	B.CreateStore(AT, SavedStatePtr);
 	B.CreateBr(ReloadBB);
     }
 
-    // The parent frame is not synched. Check for pending frame.
-    CGF.EmitBlock(UnsyncBB);
-    llvm::Value *PF = 0;
-    {
-	CGBuilderTy &B = CGF.Builder;
-	B.CreateStore(SF1, SFPtr);
-	llvm::Function *ReadyFn = CreateIniReadyFn(CGF);
-	PF = CGF.Builder.CreateCall(ReadyFn, Info->getContextValue());
-	PF->setName(pending_frame_name);
-	Value * Cond
-	    = B.CreateICmpNE(PF, ConstantPointerNull::get(
-				 cast<llvm::PointerType>(PF->getType())));
-	B.CreateCondBr(Cond,ResetATBB,SaveStateBB);
-    }
-
-    CGF.EmitBlock(ResetATBB);
-    {
-	CGBuilderTy &B = CGF.Builder;
-	B.CreateStore(LoadField(B, PF, PendingFrameBuilder::args_tags),
-		      SavedStatePtr);
-	B.CreateBr(SaveStateBB);
-    }
+    // Will require the function soon
+    CreateIniReadyFn(CGF);
 
     // From here on, we generate code to save the state, reload it and call
     // function. We will need to patch up some control flow after the fact,
@@ -3707,8 +3670,6 @@ void CGCilkPlusRuntime::EmitCilkHelperStackFrame(CodeGenFunction &CGF) {
 
     // Do this only once:
     // Push cleanups associated to this stack frame initialization.
-    // TODO: Note: Need to take stack_frame depending on functionality of
-    //       helper - create from pending or stack frame.
     // TODO: CapturedDecl knows how to avoid the CGCall code being inserted with
     //       temp alloca's and stores of args into alloca's. However, we don't
     //       use these, so they should ideally be avoided. This relates to the
@@ -3760,12 +3721,30 @@ void CGCilkPlusRuntime::EmitCilkHelperPrologue(CodeGenFunction &CGF) {
       Info->setSaveBB(SaveBB);
 
       // Terminate SaveBB with conditional branch to terminate
+      // TODO: insert call to ini_ready here
+#if 0
       Value *Ready = LookupPendingFrame(CGF);
       // llvm::PHINode *ReadyPHI
 	  // = PHINode::Create(Ready->getType(), 1, "", &SaveBB->front());
       // ReadyPHI->addIncoming(Ready, SaveBB->getSinglePredecessor());
       Value *Cond = CGF.Builder.CreateIsNotNull(Ready);
       CGF.Builder.CreateCondBr(Cond, TermBB, PrologueBB);
+#endif
+      llvm::Value *PF = 0;
+      {
+	  CGBuilderTy &B = CGF.Builder;
+	  llvm::Function *ReadyFn = Info->getIniReadyFn();
+	  // Note: we have not initialised the stack frame yet, this happens
+	  //       by the prologue function. As such, we cannot load the
+	  //       args_tags field of the stack_frame. However, this
+	  //       basic block can only be reached during the first call, i.e.,
+	  //       using the local stack_frame, not the argument-supplied one.
+	  Value *SFAT = LookupSavedState(CGF);
+	  PF = CGF.Builder.CreateCall(ReadyFn, SFAT);
+	  PF->setName(pending_frame_name);
+	  Value * Cond = B.CreateIsNotNull(PF);
+	  B.CreateCondBr(Cond,TermBB,PrologueBB);
+      }
 
       // Push stack_frame and make parent stealable. Only on the immediate
       // execution path (not in case of pending/call_fn, not in case of
@@ -3785,6 +3764,9 @@ void CGCilkPlusRuntime::EmitCilkHelperPrologue(CodeGenFunction &CGF) {
       CGF.Builder.CreateBr(Info->getReloadBB());
 
       // Terminate. Exception handling code will be added to this.
+      // We have now stored all actual arguments to the spawned function
+      // in args_tags for the stack_frame. This was speculative. The
+      // ini_ready function also has copied the args to the pending frame.
       CGF.EmitBlock(TermBB);
       CGF.Builder.CreateRetVoid();
 
