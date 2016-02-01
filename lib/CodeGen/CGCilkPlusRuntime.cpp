@@ -173,7 +173,7 @@ DEFAULT_GET_CILKRTS_FUNC(bind_thread_1)
 DEFAULT_GET_CILKRTS_FUNC(pending_frame_create)
 DEFAULT_GET_CILKRTS_FUNC(detach_pending)
 DEFAULT_GET_CILKRTS_FUNC(obj_metadata_wakeup_hard)
-DEFAULT_GET_CILKRTS_FUNC(obj_metadata_add_task) // tmp
+DEFAULT_GET_CILKRTS_FUNC(obj_metadata_add_task) // tmp - errors - leave it and hide mutex; requires some re-arranging of obj_version contents and/or just padding where the mutex would be.
 DEFAULT_GET_CILKRTS_FUNC(obj_version_destroy)
 
 #define DEFAULT_GET_CILKRTS_ANON_FUNC(name) \
@@ -315,6 +315,7 @@ public:
       TypeBuilder<__cilkrts_issue_fn_ty *,X>::get(C), // df_issue_fn
       TypeBuilder<void *,                 X>::get(C), // args_tags
       TypeBuilder<__cilkrts_stack_frame *,X>::get(C), // df_issue_child
+      TypeBuilder<__cilkrts_stack_frame**,X>::get(C), // df_issue_me_ptr
       NULL);
     return Ty;
   }
@@ -331,7 +332,8 @@ public:
     parent_pedigree,
     df_issue_fn,
     args_tags,
-    df_issue_child
+    df_issue_child,
+    df_issue_me_ptr
   };
 };
 
@@ -420,8 +422,8 @@ public:
     StructType *Ty = StructType::create(C, "spin_mutex");
     cache[&C] = Ty;
     Ty->setBody(
-      TypeBuilder<int,                   X>::get(C), // field
-      TypeBuilder<int[64/sizeof(int)-1], X>::get(C), // opaque
+      TypeBuilder<int,                          X>::get(C), // field
+      TypeBuilder<int[64/sizeof(int) - 1],	X>::get(C), // opaque
       NULL);
     return Ty;
   }
@@ -732,19 +734,24 @@ static Function *Get__cilkrts_pop_frame(CodeGenFunction &CGF) {
 ///                        void (*release_fn)(void*)) {
 ///   sf->worker->current_stack_frame = sf->call_parent;
 ///   sf->call_parent = 0;
-///
-///   bool do_release = false;
-///   if(sf->flags & CILK_FRAME_DATAFLOW_ISSUED)
-///      do_release = true;
-///   else {
-///      __cilkrts_stack_frame *parent = sf->worker->current_stack_frame;
-///      __cilkrts_stack_frame *to_issue;
-///      to_issue = CAS(&parent->df_issue_child, sf, 0);
-///      do_release = to_issue != sf;
+///   if( sf->df_issue_me_ptr ) {
+///       __cilkrts_stack_frame *to_issue
+///   	        = __sync_val_compare_and_swap(sf->df_issue_me_ptr, sf, 0);
+///   
+///      if( to_issue != sf ) {
+///   	     __cilkrts_stack_frame *ts
+///   	       = (__cilkrts_stack_frame *)((uintptr_t)to_issue & ~(uintptr_t)1);
+///   
+///   	    if( ts == sf ) {
+///   	       do {
+///   		   ts = *sf->df_issue_me_ptr;
+///   	       } while( ts == to_issue );
+///   	    }
+///         (*release_fn)(sf->args_tags);
+///   	 }
+///   } else {
+///      (*release_fn)(sf->args_tags);
 ///   }
-///   if(do_release)
-///      __cilkrts_df_spawn_helper_release_fn(sf->args_tags);
-/// }
 static Function *Get__cilkrts_pop_frame_df(CodeGenFunction &CGF) {
   Function *Fn = 0;
 
@@ -759,12 +766,18 @@ static Function *Get__cilkrts_pop_frame_df(CodeGenFunction &CGF) {
 
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
   BasicBlock *CAS = BasicBlock::Create(Ctx, "cas", Fn);
+  BasicBlock *ChkWait = BasicBlock::Create(Ctx, "chk_wait", Fn);
   BasicBlock *ChkDone = BasicBlock::Create(Ctx, "chk_done", Fn);
   BasicBlock *Release = BasicBlock::Create(Ctx, "release", Fn);
   BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
 
+  llvm::PointerType * SFPtrTy
+      = TypeBuilder<__cilkrts_stack_frame*, false>::get(Ctx);
+  llvm::Type * Int64Ty = llvm::Type::getInt64Ty(Ctx);
+
   // Entry
   Value *Parent = 0;
+  Value *MePtr = 0;
   {
       CGBuilderTy B(Entry);
 
@@ -778,57 +791,49 @@ static Function *Get__cilkrts_pop_frame_df(CodeGenFunction &CGF) {
 		 Constant::getNullValue(TypeBuilder<__cilkrts_stack_frame*, false>::get(Ctx)),
 		 SF, StackFrameBuilder::call_parent);
 
-      // if(sf->flags & CILK_FRAME_DATAFLOW_ISSUED)
-      // Would make sense to check flags & DATAFLOW: if not, exit immediately
-/*
-      Value *Flags = LoadField(B, SF, StackFrameBuilder::flags);
-      Value *DF_Issued =
-	  ConstantInt::get(Flags->getType(), CILK_FRAME_DATAFLOW_ISSUED);
-      Value *And = B.CreateAnd(Flags, DF_Issued);
-      Value *Cmp = B.CreateICmpNE(And, ConstantInt::get(And->getType(), 0));
-*/
-      Value *ParentZ = ConstantPointerNull::get(
-	  cast<llvm::PointerType>(Parent->getType()));
-      Value *Cmp = B.CreateICmpEQ(Parent, ParentZ);
-      B.CreateCondBr(Cmp, Release, CAS);
+      // if( sf->df_issue_me_ptr ) {
+      MePtr = LoadField(B, SF, StackFrameBuilder::df_issue_me_ptr);
+      Value *Cmp = B.CreateICmpNE( MePtr, ConstantPointerNull::get(SFPtrTy));
+      B.CreateCondBr(Cmp, CAS, Release);
   }
 
   // CAS
-  Value *NewVal;
+  Value *ToIssue;
   {
       CGBuilderTy B(CAS);
 
-      // __cilkrts_stack_frame *parent = ...
-      // __cilkrts_stack_frame *to_issue;
-      // to_issue = CAS(&parent->df_issue_child, sf, 0);
-      Value *DFIC = GEP(B, Parent, StackFrameBuilder::df_issue_child);
-      // Value *DFICVal = B.CreateLoad(DFIC);
-      Value *DFICVal = SF;
-      NewVal = ConstantPointerNull::get(
-	  cast<llvm::PointerType>(DFICVal->getType()));
-      Value *ToIssue
-	  = B.CreateAtomicCmpXchg(DFIC, DFICVal, NewVal,
-				  llvm::SequentiallyConsistent);
-      // do_release = to_issue != sf;
-      // to_issue can 0, 1 or sf
-      Value *Cmp = B.CreateICmpNE(ToIssue, SF);
-      B.CreateCondBr(Cmp, ChkDone, Exit);
+      // __cilkrts_stack_frame *to_issue
+      //      = __sync_val_compare_and_swap(sf->df_issue_me_ptr, sf, 0);
+      ToIssue = B.CreateAtomicCmpXchg(
+	  MePtr, SF, ConstantPointerNull::get(SFPtrTy),
+	  llvm::SequentiallyConsistent);
+
+      // if( to_issue == sf )
+      Value *Cmp = B.CreateICmpEQ(ToIssue, SF);
+      B.CreateCondBr(Cmp, Exit, ChkWait);
   }
 
-  // ChkDone - to_issue is 0 or 1
-  // Wait until issue has completed. We are about to leave our stack frame,
-  // which implies deallocating args_tags. Yet another thread is accessing
-  // args_tags, which causes a race condition. We need to wait for the other
-  // thread to finish before de-allocating (or proceeding with pop).
-  // The problem could be solved by dynamically allocating args_tags, but
-  // that would be slow in comparison to this solution as the waiting
-  // rarely occurs and is expected to be short.
+  {
+      CGBuilderTy B(ChkWait);
+
+      // __cilkrts_stack_frame *ts
+      //     = (__cilkrts_stack_frame *)((uintptr_t)to_issue & ~(uintptr_t)1);
+      Value *ToIssueInt = B.CreatePtrToInt(ToIssue, Int64Ty); 
+      Value *One = ConstantInt::get(Int64Ty,(unsigned long long)1);
+      Value *NotOne = B.CreateNot(One);
+      Value *ToIssueClean = B.CreateAnd(ToIssueInt, NotOne);
+
+      // if( ts == sf )
+      Value *Cmp = B.CreateICmpEQ(ToIssueClean, SF);
+      B.CreateCondBr(Cmp, ChkDone, Release);
+  }
+
   {
       CGBuilderTy B(ChkDone);
       // TODO: make field volatile or insert memory barrier in light of
       //       compiler optimizations
-      Value *ToIssue = LoadField(B, Parent, StackFrameBuilder::df_issue_child);
-      Value *Cmp = B.CreateICmpEQ(ToIssue, NewVal);
+      Value *Probe = B.CreateLoad(MePtr);
+      Value *Cmp = B.CreateICmpEQ(Probe, ToIssue);
       B.CreateCondBr(Cmp, ChkDone, Release);
   }
 
@@ -1319,8 +1324,10 @@ static Function *Get__cilkrts_enter_frame_1(CodeGenFunction &CGF) {
 ///     sf->worker = w;
 ///     /* sf->except_data is only valid when CILK_FRAME_EXCEPTING is set */
 ///     w->current_stack_frame = sf;
-///     if(sf->call_parent)
+///     if(sf->call_parent) {
 ///        sf->call_parent->df_issue_child = sf;
+///        sf->df_issue_me_ptr = &sf->call_parent->df_issue_child;
+///     }
 /// }
 static Function *Get__cilkrts_enter_frame_df(CodeGenFunction &CGF) {
   Function *Fn = 0;
@@ -1395,6 +1402,8 @@ static Function *Get__cilkrts_enter_frame_df(CodeGenFunction &CGF) {
   {
       CGBuilderTy B(SetIssue);
       StoreField(B, SF, CP, StackFrameBuilder::df_issue_child);
+      StoreField(B, GEP(B, CP, StackFrameBuilder::df_issue_child), SF,
+		 StackFrameBuilder::df_issue_me_ptr);
       B.CreateRetVoid();
   }
 
@@ -1466,6 +1475,7 @@ static Function *Get__cilkrts_enter_frame_fast_1(CodeGenFunction &CGF) {
 ///     /* sf->except_data is only valid when CILK_FRAME_EXCEPTING is set */
 ///     w->current_stack_frame = sf;
 ///     sf->call_parent->df_issue_child = sf;
+///     sf->df_issue_me_ptr = &sf->call_parent->df_issue_child;
 /// }
 static Function *Get__cilkrts_enter_frame_fast_df(CodeGenFunction &CGF) {
   Function *Fn = 0;
@@ -1494,6 +1504,8 @@ static Function *Get__cilkrts_enter_frame_fast_df(CodeGenFunction &CGF) {
   StoreField(B, SF, W, WorkerBuilder::current_stack_frame);
 
   StoreField(B, SF, CP, StackFrameBuilder::df_issue_child);
+  StoreField(B, GEP(B, CP, StackFrameBuilder::df_issue_child), SF,
+	     StackFrameBuilder::df_issue_me_ptr);
 
   B.CreateRetVoid();
 
@@ -1636,8 +1648,11 @@ static llvm::Function *GetCilkHelperPrologue(CodeGenFunction &CGF) {
 ///   if( !PARENT_SYNCED ) {
 ///	  sf->flags |= CILK_FRAME_DATAFLOW_ISSUED;
 ///	  (*issue_fn)( 0, at ); // pending_frame *, void *
-///   } else
+///       sf->df_issue_me_ptr = 0;
+///   } else {
 ///	  sf->call_parent->df_issue_child = sf;
+///       sf->df_issue_me_ptr = &sf->call_parent->df_issue_child;
+///   }
 ///   __cilkrts_detach(sf);
 /// }
 static llvm::Function *GetCilkDataflowHelperPrologue(CodeGenFunction &CGF) {
@@ -1690,12 +1705,21 @@ static llvm::Function *GetCilkDataflowHelperPrologue(CodeGenFunction &CGF) {
       // llvm::PointerType::getUnqual(
 	  // TypeBuilder<__cilkrts_pending_frame, false>::get(Ctx)));
   B.CreateCall2(IF, SFNull, AT);
+
+  //    sf->df_issue_me_ptr = 0;
+  StoreField(B, ConstantPointerNull::get(
+		 TypeBuilder<__cilkrts_stack_frame**, false>::get(Ctx)),
+	     SF, StackFrameBuilder::df_issue_me_ptr);
+
   B.CreateBr(Exit);
 
   B.SetInsertPoint(Unsync);
   //	sf->call_parent->df_issue_child = sf;
   Value *CP = LoadField(B, SF, StackFrameBuilder::call_parent);
   StoreField(B, SF, CP, StackFrameBuilder::df_issue_child);
+  //    sf->df_issue_me_ptr = &sf->call_parent->df_issue_child;
+  StoreField(B, GEP(B, CP, StackFrameBuilder::df_issue_child), SF,
+	     StackFrameBuilder::df_issue_me_ptr);
   B.CreateBr(Exit);
 
   // __cilkrts_detach(sf);
@@ -1909,11 +1933,11 @@ static Function *Get__cilkrts_obj_metadata_ini_ready(CodeGenFunction &CGF) {
 /// void __cilkrts_obj_metadata_wakeup(struct __cilkrts_ready_list *rlist,
 ///                                    struct __cilkrts_obj_metadata *meta ) {
 ///     lock();
-///     if( --oldest.num_tasks > 0 ) {
+///     if( --meta->oldest_num_tasks > 0 ) {
 ///         unlock();
-///     } else if( num_gens == 1 ) {
-///         pop_generation();
-///         youngest.clr_tasks();
+///     } else if( meta->num_gens == 1 ) {
+///         meta->num_gens = 0;
+///         meta->youngest_group = CILK_OBJ_GROUP_EMPTY;
 ///         unlock();
 ///     } else
 ///         wakeup_hard(rlist, meta);
@@ -2059,7 +2083,7 @@ static Function *Get__cilkrts_move_to_ready_list(CodeGenFunction &CGF) {
 }
 
 
-/// \brief Get or create a LLVM function for __cilkrts_obj_metadata_ini_ready.
+/// \brief Get or create a LLVM function for __cilkrts_obj_metadata_add_pending_to_ready_list.
 /// It is equivalent to the following C code
 ///
 /// void __cilkrts_obj_metadata_add_pending_to_ready_list(
@@ -2089,7 +2113,7 @@ Get__cilkrts_obj_metadata_add_pending_to_ready_list(CodeGenFunction &CGF) {
 	     PF, PendingFrameBuilder::next_ready_frame);
   Value *RL = GEP(B, W, WorkerBuilder::ready_list);
   Value *Tail = LoadField(B, RL, ReadyListBuilder::tail);
-  StoreField(B, Tail, PF, PendingFrameBuilder::next_ready_frame);
+  StoreField(B, PF, Tail, PendingFrameBuilder::next_ready_frame);
   StoreField(B, PF, RL, ReadyListBuilder::tail);
   B.CreateRetVoid();
 
@@ -2183,10 +2207,11 @@ Get__cilkrts_obj_version_del_ref(CodeGenFunction &CGF) {
   return Fn;
 }
 
+#if 0
 // TODO: create specialized version to call when issueing executing task
 //       in this case we know what state metadata can be in.
 // TODO: "vectorize" calculation of pushg, joins using regular registers
-#if 0
+// TODO: inlined version of add_task is apparently incorrect...
 static Function *
 Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
   Function *Fn = 0;
@@ -2231,12 +2256,12 @@ Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
 	Value *NotWrite = ConstantInt::get(GRP->getType(), CILK_OBJ_GROUP_NOT_WRITE);
 	Value *AndNotWrite = B.CreateAnd(GrpOrEmpty, NotWrite);
 	Value *AndG = B.CreateAnd(G, AndNotWrite);
-	Value *Joins = B.CreateIsNotNull(AndG);
+	Value *Zero = ConstantInt::get(GRP->getType(), 0);
+	Value *Joins = B.CreateICmpNE(AndG, Zero);
 
 	// bool pushg = !youngest.push_group( g );
 	Value *GrpAndNotWrite = B.CreateAnd(GRP, NotWrite);
 	Value *AndG2 = B.CreateAnd(G, GrpAndNotWrite);
-	Value *Zero = ConstantInt::get(GRP->getType(), 0);
 	PushG = B.CreateICmpEQ(AndG2, Zero);
 
 	// bool ready = joins & ( num_gens <= 1 );
@@ -2274,7 +2299,7 @@ Get__cilkrts_obj_metadata_add_task(CodeGenFunction &CGF) {
 	llvm::PointerType *PTy = cast<llvm::PointerType>(InCnt->getType());
 	Value *InCnt1 = ConstantInt::get(PTy->getContainedType(0), 1);
 	B.CreateAtomicRMW(llvm::AtomicRMWInst::Add, InCnt, InCnt1,
-			  llvm::SequentiallyConsistent);
+			  llvm::SequentiallyConsistent); // TODO: relax
 
 	// __cilkrts_task_list_node * old_tail = tasks.tail;
 	Value *Tasks = GEP(B, Meta, ObjMetadataBuilder::tasks);
@@ -2629,6 +2654,7 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
       // Copy args_tags from stack frame to pending frame
       // TODO: memcpy could be faster if we knew it was aligned (twice).
       //       PFAT is probably 8-byte aligned. Not sure for ATVoid.
+      // TODO: memcpy only args part, tags not initialised yet.
       Value *PFAT = LoadField(B, PF, PendingFrameBuilder::args_tags);
       B.CreateMemCpy(PFAT, ATVoid, Size, false);
 
@@ -2730,7 +2756,8 @@ CreateIssueFn(CodeGenFunction &CGF,
 	      B.CreateCall(CILKRTS_FUNC(obj_version_add_ref, CGF), Var);
 	      Value *Meta = GEP(B, Var, ObjVersionBuilder::meta);
 	      // struct.__cilkrts_obj_metadata != __cilkrts_obj_metadata
-	      Value *CMeta = B.CreatePointerCast(Meta, (++WrFn->arg_begin())->getType());
+	      // Value *CMeta = B.CreatePointerCast(Meta, (++WrFn->arg_begin())->getType());
+	      Value *CMeta = Meta;
 	      Value *Tag = GEP(B, Tags, i);
 	      switch( GetDataflowKind( type ) ) {
 	      case CILK_OBJ_GROUP_READ:
@@ -3720,16 +3747,7 @@ void CGCilkPlusRuntime::EmitCilkHelperPrologue(CodeGenFunction &CGF) {
       BasicBlock *TermBB = CGF.createBasicBlock("__cilk_term");
       Info->setSaveBB(SaveBB);
 
-      // Terminate SaveBB with conditional branch to terminate
-      // TODO: insert call to ini_ready here
-#if 0
-      Value *Ready = LookupPendingFrame(CGF);
-      // llvm::PHINode *ReadyPHI
-	  // = PHINode::Create(Ready->getType(), 1, "", &SaveBB->front());
-      // ReadyPHI->addIncoming(Ready, SaveBB->getSinglePredecessor());
-      Value *Cond = CGF.Builder.CreateIsNotNull(Ready);
-      CGF.Builder.CreateCondBr(Cond, TermBB, PrologueBB);
-#endif
+      // Terminate SaveBB with conditional branch to TermBB
       llvm::Value *PF = 0;
       {
 	  CGBuilderTy &B = CGF.Builder;
