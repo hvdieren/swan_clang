@@ -111,6 +111,8 @@ typedef void (__cilkrts_pop_frame_df)(__cilkrts_stack_frame *sf, void (*release_
 typedef __cilkrts_worker *(__cilkrts_get_tls_worker)();
 typedef __cilkrts_worker *(__cilkrts_get_tls_worker_fast)();
 typedef __cilkrts_worker *(__cilkrts_bind_thread_1)();
+typedef void (__cilkrts_worker_lock)(__cilkrts_worker *w);
+typedef void (__cilkrts_worker_unlock)(__cilkrts_worker *w);
 typedef void (__cilkrts_cilk_for_32)(__cilk_abi_f32_t body, void *data,
                                      cilk32_t count, int grain);
 typedef void (__cilkrts_cilk_for_64)(__cilk_abi_f64_t body, void *data,
@@ -169,10 +171,13 @@ DEFAULT_GET_CILKRTS_FUNC(sync)
 DEFAULT_GET_CILKRTS_FUNC(rethrow)
 DEFAULT_GET_CILKRTS_FUNC(leave_frame)
 DEFAULT_GET_CILKRTS_FUNC(get_tls_worker)
+DEFAULT_GET_CILKRTS_FUNC(worker_lock)
+DEFAULT_GET_CILKRTS_FUNC(worker_unlock)
 DEFAULT_GET_CILKRTS_FUNC(bind_thread_1)
 DEFAULT_GET_CILKRTS_FUNC(pending_frame_create)
 DEFAULT_GET_CILKRTS_FUNC(detach_pending)
 DEFAULT_GET_CILKRTS_FUNC(obj_metadata_wakeup_hard)
+DEFAULT_GET_CILKRTS_FUNC(pop_frame_df) // tmp - error: need to fix volatile load in pop_frame_df for df_issue_me_ptr, or issue barrier.
 DEFAULT_GET_CILKRTS_FUNC(obj_metadata_add_task) // tmp - errors - leave it and hide mutex; requires some re-arranging of obj_version contents and/or just padding where the mutex would be.
 DEFAULT_GET_CILKRTS_FUNC(obj_version_destroy)
 
@@ -315,7 +320,7 @@ public:
       TypeBuilder<__cilkrts_issue_fn_ty *,X>::get(C), // df_issue_fn
       TypeBuilder<void *,                 X>::get(C), // args_tags
       TypeBuilder<__cilkrts_stack_frame *,X>::get(C), // df_issue_child
-      TypeBuilder<__cilkrts_stack_frame**,X>::get(C), // df_issue_me_ptr
+      TypeBuilder<__cilkrts_stack_frame*volatile*,X>::get(C), // df_issue_me_ptr
       NULL);
     return Ty;
   }
@@ -727,6 +732,7 @@ static Function *Get__cilkrts_pop_frame(CodeGenFunction &CGF) {
   return Fn;
 }
 
+#if 0
 /// \brief Get or create a LLVM function for __cilkrts_pop_frame_df.
 /// It is equivalent to the following C code
 ///
@@ -855,6 +861,7 @@ static Function *Get__cilkrts_pop_frame_df(CodeGenFunction &CGF) {
 
   return Fn;
 }
+#endif
 
 
 /// \brief Get or create a LLVM function for __cilkrts_detach.
@@ -1469,7 +1476,7 @@ static Function *Get__cilkrts_enter_frame_fast_1(CodeGenFunction &CGF) {
 /// void __cilkrts_enter_frame_fast_df(struct __cilkrts_stack_frame *sf)
 /// {
 ///     struct __cilkrts_worker *w = __cilkrts_get_tls_worker();
-///     sf->flags = CILK_FRAME_VERSION;
+///     sf->flags = CILK_FRAME_VERSION | CILK_FRAME_DATAFLOW;
 ///     sf->call_parent = w->current_stack_frame;
 ///     sf->worker = w;
 ///     /* sf->except_data is only valid when CILK_FRAME_EXCEPTING is set */
@@ -1496,7 +1503,7 @@ static Function *Get__cilkrts_enter_frame_fast_df(CodeGenFunction &CGF) {
   llvm::Type *Ty = SFTy->getElementType(StackFrameBuilder::flags);
 
   StoreField(B,
-    ConstantInt::get(Ty, CILK_FRAME_VERSION),
+    ConstantInt::get(Ty, CILK_FRAME_VERSION | CILK_FRAME_DATAFLOW),
     SF, StackFrameBuilder::flags);
   Value *CP = LoadField(B, W, WorkerBuilder::current_stack_frame);
   StoreField(B, CP, SF, StackFrameBuilder::call_parent);
@@ -2032,8 +2039,10 @@ static Function *Get__cilkrts_obj_metadata_wakeup(CodeGenFunction &CGF) {
 /// void __cilkrts_move_to_ready_list(__cilkrts_worker *w,
 ///                                   struct __cilkrts_ready_list *rlist) {
 ///     if( 0 != rlist->head_next_ready_frame ) {
+///         __cilkrts_worker_lock(w);
 ///	    w->ready_list.tail->next_ready_frame = rlist->head_next_ready_frame;
 ///	    w->ready_list.tail = rlist->tail;
+///         __cilkrts_worker_unlock(w);
 ///     }
 /// }
 static Function *Get__cilkrts_move_to_ready_list(CodeGenFunction &CGF) {
@@ -2064,11 +2073,13 @@ static Function *Get__cilkrts_move_to_ready_list(CodeGenFunction &CGF) {
 
   {
       CGBuilderTy B(NotEmpty);
+      B.CreateCall(CILKRTS_FUNC(worker_lock, CGF), W);
       Value *WRL = GEP(B, W, WorkerBuilder::ready_list);
       Value *WTail = LoadField(B, WRL, ReadyListBuilder::tail);
       StoreField(B, HNRF, WTail, ReadyListBuilder::head_next_ready_frame);
       Value *Tail = LoadField(B, RL, ReadyListBuilder::tail);
       StoreField(B, Tail, WRL, ReadyListBuilder::tail);
+      B.CreateCall(CILKRTS_FUNC(worker_unlock, CGF), W);
       B.CreateRetVoid();
   }
 
@@ -2082,15 +2093,16 @@ static Function *Get__cilkrts_move_to_ready_list(CodeGenFunction &CGF) {
   return Fn;
 }
 
-
 /// \brief Get or create a LLVM function for __cilkrts_obj_metadata_add_pending_to_ready_list.
 /// It is equivalent to the following C code
 ///
 /// void __cilkrts_obj_metadata_add_pending_to_ready_list(
 ///             __cilkrts_worker *w, __cilkrts_pending_frame *pf) {
+///    __cilkrts_worker_lock(w);
 ///    pf->next_ready_frame = 0;
 ///    w->ready_list.tail->next_ready_frame = pf;
 ///    w->ready_list.tail = pf;
+///    __cilkrts_worker_unlock(w);
 /// }
 static Function *
 Get__cilkrts_obj_metadata_add_pending_to_ready_list(CodeGenFunction &CGF) {
@@ -2108,6 +2120,7 @@ Get__cilkrts_obj_metadata_add_pending_to_ready_list(CodeGenFunction &CGF) {
 
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
   CGBuilderTy B(Entry);
+  B.CreateCall(CILKRTS_FUNC(worker_lock, CGF), W);
   StoreField(B, ConstantPointerNull::get(
 		 cast<llvm::PointerType>(PF->getType())),
 	     PF, PendingFrameBuilder::next_ready_frame);
@@ -2115,6 +2128,7 @@ Get__cilkrts_obj_metadata_add_pending_to_ready_list(CodeGenFunction &CGF) {
   Value *Tail = LoadField(B, RL, ReadyListBuilder::tail);
   StoreField(B, PF, Tail, PendingFrameBuilder::next_ready_frame);
   StoreField(B, PF, RL, ReadyListBuilder::tail);
+  B.CreateCall(CILKRTS_FUNC(worker_unlock, CGF), W);
   B.CreateRetVoid();
 
   Fn->addFnAttr(Attribute::InlineHint);
@@ -3469,9 +3483,6 @@ RewriteHelperFunction(CGCilkDataflowSpawnInfo *Info,
     else if( llvm::InvokeInst * TheInvoke = dyn_cast<llvm::InvokeInst>(RVInst) )
 	NumArgs = TheInvoke->getNumArgOperands();
 
-    BasicBlock * SaveBB = Info->getSaveBB();
-
-    // CGBuilderTy B1(BasicBlock::iterator(SaveBB->getTerminator()));
     // LookupPendingFrame() returns the call to IniReadyFn() as this returns
     // the pending frame.
     
