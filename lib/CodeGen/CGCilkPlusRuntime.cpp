@@ -177,7 +177,6 @@ DEFAULT_GET_CILKRTS_FUNC(bind_thread_1)
 DEFAULT_GET_CILKRTS_FUNC(pending_frame_create)
 DEFAULT_GET_CILKRTS_FUNC(detach_pending)
 DEFAULT_GET_CILKRTS_FUNC(obj_metadata_wakeup_hard)
-DEFAULT_GET_CILKRTS_FUNC(pop_frame_df) // tmp - error: need to fix volatile load in pop_frame_df for df_issue_me_ptr, or issue barrier.
 DEFAULT_GET_CILKRTS_FUNC(obj_metadata_add_task) // tmp - errors - leave it and hide mutex; requires some re-arranging of obj_version contents and/or just padding where the mutex would be.
 DEFAULT_GET_CILKRTS_FUNC(obj_version_destroy)
 
@@ -732,7 +731,6 @@ static Function *Get__cilkrts_pop_frame(CodeGenFunction &CGF) {
   return Fn;
 }
 
-#if 0
 /// \brief Get or create a LLVM function for __cilkrts_pop_frame_df.
 /// It is equivalent to the following C code
 ///
@@ -779,7 +777,11 @@ static Function *Get__cilkrts_pop_frame_df(CodeGenFunction &CGF) {
 
   llvm::PointerType * SFPtrTy
       = TypeBuilder<__cilkrts_stack_frame*, false>::get(Ctx);
+  llvm::PointerType * SFPtrPtrTy
+      = TypeBuilder<__cilkrts_stack_frame**, false>::get(Ctx);
   llvm::Type * Int64Ty = llvm::Type::getInt64Ty(Ctx);
+  llvm::PointerType * Int64PtrTy
+      = llvm::PointerType::getUnqual(Int64Ty);
 
   // Entry
   Value *Parent = 0;
@@ -799,23 +801,25 @@ static Function *Get__cilkrts_pop_frame_df(CodeGenFunction &CGF) {
 
       // if( sf->df_issue_me_ptr ) {
       MePtr = LoadField(B, SF, StackFrameBuilder::df_issue_me_ptr);
-      Value *Cmp = B.CreateICmpNE( MePtr, ConstantPointerNull::get(SFPtrTy));
+      Value *Cmp = B.CreateICmpNE( MePtr, ConstantPointerNull::get(SFPtrPtrTy));
       B.CreateCondBr(Cmp, CAS, Release);
   }
 
   // CAS
-  Value *ToIssue;
+  Value *ToIssueInt;
+  Value *SFInt;
   {
       CGBuilderTy B(CAS);
 
       // __cilkrts_stack_frame *to_issue
       //      = __sync_val_compare_and_swap(sf->df_issue_me_ptr, sf, 0);
-      ToIssue = B.CreateAtomicCmpXchg(
-	  MePtr, SF, ConstantPointerNull::get(SFPtrTy),
-	  llvm::SequentiallyConsistent);
+      SFInt = B.CreatePtrToInt(SF,Int64Ty);
+      ToIssueInt = B.CreateAtomicCmpXchg(
+	  B.CreatePointerCast(MePtr,Int64PtrTy), SFInt,
+	  ConstantInt::get(Int64Ty,0), llvm::SequentiallyConsistent);
 
       // if( to_issue == sf )
-      Value *Cmp = B.CreateICmpEQ(ToIssue, SF);
+      Value *Cmp = B.CreateICmpEQ(ToIssueInt, SFInt);
       B.CreateCondBr(Cmp, Exit, ChkWait);
   }
 
@@ -824,13 +828,13 @@ static Function *Get__cilkrts_pop_frame_df(CodeGenFunction &CGF) {
 
       // __cilkrts_stack_frame *ts
       //     = (__cilkrts_stack_frame *)((uintptr_t)to_issue & ~(uintptr_t)1);
-      Value *ToIssueInt = B.CreatePtrToInt(ToIssue, Int64Ty); 
+      // Value *ToIssueInt = B.CreatePtrToInt(ToIssue, Int64Ty); 
       Value *One = ConstantInt::get(Int64Ty,(unsigned long long)1);
       Value *NotOne = B.CreateNot(One);
       Value *ToIssueClean = B.CreateAnd(ToIssueInt, NotOne);
 
       // if( ts == sf )
-      Value *Cmp = B.CreateICmpEQ(ToIssueClean, SF);
+      Value *Cmp = B.CreateICmpEQ(ToIssueClean, SFInt);
       B.CreateCondBr(Cmp, ChkDone, Release);
   }
 
@@ -838,7 +842,8 @@ static Function *Get__cilkrts_pop_frame_df(CodeGenFunction &CGF) {
       CGBuilderTy B(ChkDone);
       // TODO: make field volatile or insert memory barrier in light of
       //       compiler optimizations
-      Value *Probe = B.CreateLoad(MePtr);
+      Value *Probe = B.CreateLoad(MePtr, /*volatile*/true);
+      Value *ToIssue = B.CreateIntToPtr(ToIssueInt, SFPtrTy);
       Value *Cmp = B.CreateICmpEQ(Probe, ToIssue);
       B.CreateCondBr(Cmp, ChkDone, Release);
   }
@@ -861,8 +866,6 @@ static Function *Get__cilkrts_pop_frame_df(CodeGenFunction &CGF) {
 
   return Fn;
 }
-#endif
-
 
 /// \brief Get or create a LLVM function for __cilkrts_detach.
 /// It is equivalent to the following C code
@@ -2896,7 +2899,7 @@ CreateReleaseFn(CodeGenFunction &CGF,
 	  B.CreateCall(CILKRTS_FUNC(obj_version_del_ref, CGF), Var);
 	  // Store a zero for safety
 	  StoreField(B, ConstantPointerNull::get(
-			 llvm::PointerType::getUnqual(Var->getType())),
+			 cast<llvm::PointerType>(Var->getType())),
 		     VarPtr, ObjInstanceBuilder::version);
 	  ++i;
       }
@@ -3390,8 +3393,11 @@ ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
 	if( isa<llvm::AllocaInst>(I->first) ) {
 	    llvm::AllocaInst * Alloca = cast<llvm::AllocaInst>(I->first);
 	    idx[1] = llvm::ConstantInt::get(Int32Ty, I->second.field);
-	    llvm::GetElementPtrInst *GEP = llvm::GetElementPtrInst::Create(
+	    llvm::Instruction *GEP = llvm::GetElementPtrInst::Create(
 		Args, idx, "", Alloca );
+	    if( GEP->getType() != I->first->getType() )
+		GEP = llvm::CastInst::CreatePointerCast(
+		    GEP, Alloca->getType(), "", Alloca);
 
 	    // Alloca->replaceAllUsesWith(GEP); -- duplicate?
 	    I->second.GEP = GEP;
@@ -3748,8 +3754,12 @@ void CGCilkPlusRuntime::EmitCilkHelperPrologue(CodeGenFunction &CGF) {
   CodeGenFunction::CGCilkDataflowSpawnInfo
       *Info = dyn_cast<CodeGenFunction::CGCilkDataflowSpawnInfo>(
 	  CGF.CapturedStmtInfo);
+
   if( Info ){
       LLVMContext &Ctx = CGF.getLLVMContext();
+      llvm::PointerType *VoidPtrTy
+	  = llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx));
+
       // Initialize the stack frame and detach
       // Create args_tags, store issue function and store args_tags
       llvm::Function *IF = Info->getIssueFn(); // CreateIssueFn(CGF);
@@ -3769,7 +3779,8 @@ void CGCilkPlusRuntime::EmitCilkHelperPrologue(CodeGenFunction &CGF) {
 	  //       basic block can only be reached during the first call, i.e.,
 	  //       using the local stack_frame, not the argument-supplied one.
 	  Value *SFAT = LookupSavedState(CGF);
-	  PF = CGF.Builder.CreateCall(ReadyFn, SFAT);
+	  Value *SFATVoid = B.CreatePointerCast(SFAT, VoidPtrTy);
+	  PF = CGF.Builder.CreateCall(ReadyFn, SFATVoid);
 	  PF->setName(pending_frame_name);
 	  Value * Cond = B.CreateIsNotNull(PF);
 	  B.CreateCondBr(Cond,TermBB,PrologueBB);
@@ -3787,7 +3798,7 @@ void CGCilkPlusRuntime::EmitCilkHelperPrologue(CodeGenFunction &CGF) {
       Value *PSCast
 	  = CGF.Builder.CreateZExt(PS, llvm::Type::getInt32Ty(Ctx));
       Value *ATCast
-	  = CGF.Builder.CreateBitCast(AT, llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx)));
+	  = CGF.Builder.CreatePointerCast(AT, VoidPtrTy);
       CGF.Builder.CreateCall4(GetCilkDataflowHelperPrologue(CGF),
 			      SF, ATCast, IF, PSCast);
       CGF.Builder.CreateBr(Info->getReloadBB());

@@ -512,7 +512,7 @@ public:
   class CGCilkDataflowSpawnInfo : public CGCilkSpawnInfo {
   public:
       struct RemapInfo {
-	  llvm::GetElementPtrInst *GEP;
+	  llvm::Instruction *GEP;
 	  unsigned field;
 	
 	  RemapInfo(unsigned f=0) : GEP(0), field(f) { }
