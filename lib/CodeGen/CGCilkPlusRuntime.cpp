@@ -2726,7 +2726,7 @@ static void
 CreateIssueFn(CodeGenFunction &CGF,
 	      CallExpr::const_arg_iterator ArgBeg,
 	      CallExpr::const_arg_iterator ArgEnd) {
-  llvm::errs() << " *** CreateIssueFn ***\n";
+  // llvm::errs() << " *** CreateIssueFn ***\n";
 
   LLVMContext &Ctx = CGF.getLLVMContext();
 
@@ -2918,21 +2918,6 @@ CreateReleaseFn(CodeGenFunction &CGF,
   Fn->addFnAttr(Attribute::InlineHint);
 
   return Fn;
-}
-
-static QualType
-GetDataflowTagType( ASTContext & Ctx, QualType qtype ) {
-    CXXRecordDecl * r = qtype.getTypePtr()->getAsCXXRecordDecl();
-    for( DeclContext::decl_iterator
-	     DI=r->decls_begin(), DE=r->decls_end(); DI != DE; ++DI ) {
-	Decl *D = *DI;
-	if( TypedefDecl * TD = dyn_cast<TypedefDecl>(D) ) {
-	    if( IdentifierInfo * id = TD->getIdentifier() )
-		if( id->isStr( "__tag_type" ) )
-		    return Ctx.getTypeDeclType(TD);
-	}
-    }
-    return QualType();
 }
 
 static const char *stack_frame_name = "__cilkrts_sf";
@@ -3200,7 +3185,7 @@ static void maybeCleanupBoundTemporary(CodeGenFunction &CGF,
 llvm::Function *
 CodeGenFunction::EmitSpawnCapturedStmt(const CapturedStmt &S,
                                        VarDecl *ReceiverDecl) {
-    llvm::errs() << " *** EmitSpawnCapturedStmt ***\n";
+  // llvm::errs() << " *** EmitSpawnCapturedStmt ***\n";
 
   const CapturedDecl *CD = S.getCapturedDecl();
   const RecordDecl *RD = S.getCapturedRecordDecl();
@@ -3225,7 +3210,7 @@ CodeGenFunction::EmitSpawnCapturedStmt(const CapturedStmt &S,
   // Emit the CapturedDecl
   const CallExpr * Spawn;
   bool IsDataflow = isDataFlowSpawn( *this, &S, Spawn );
-  errs() << "is dataflow? " << ( IsDataflow ? "yes" : "no" ) << "\n";
+  // errs() << "is dataflow? " << ( IsDataflow ? "yes" : "no" ) << "\n";
 
   CodeGenFunction CGF(CGM, true);
   if( IsDataflow )
@@ -3268,7 +3253,7 @@ CodeGenFunction::
 ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
 				CallExpr::const_arg_iterator ArgEnd,
 				llvm::Type *CalleeType) {
-    llvm::errs() << " *** ConstructCilkDataflowSavedState ***\n";
+    // llvm::errs() << " *** ConstructCilkDataflowSavedState ***\n";
 
     LLVMContext &Ctx = getLLVMContext();
 
@@ -3285,7 +3270,7 @@ ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
 
     std::vector<llvm::Type *> SavedStateTypes;
     std::vector<llvm::Type *> TagTypes;
-    llvm::errs() << "CGF === dump new alloca's:\n";
+    // llvm::errs() << "CGF === dump new alloca's:\n";
     CallExpr::const_arg_iterator Arg = ArgBeg;
     unsigned field = 0;
     for( llvm::BasicBlock::iterator
@@ -3293,7 +3278,7 @@ ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
 	llvm::AllocaInst * Alloca = dyn_cast<llvm::AllocaInst>(&*I);
 	assert( Alloca && "Confused about Alloca's inserted" );
 
-	Alloca->dump();
+	// Alloca->dump();
 
 	// Define llvm::StructType with all relevant fields.
 	// All things requiring an alloca need to be saved in order to
@@ -3312,12 +3297,14 @@ ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
 	    SavedStateTypes.push_back( PTy->getContainedType(0) );
     }
 
+/*
     llvm::errs() << "CGF === Args types:\n";
     for( std::vector<llvm::Type *>::const_iterator
 	     I=SavedStateTypes.begin(), E=SavedStateTypes.end(); I != E; ++I ) {
 	(*I)->dump();
 	llvm::errs() << "\n";
     }
+*/
 
     // All other arguments to the function call must be saved in the
     // structure as well, i.e., ints, constants, ...
@@ -3332,7 +3319,7 @@ ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
 	assert( FnTy );
 	// Add return value, if any
 	if( !FnTy->getReturnType()->isVoidTy() ) {
-	    errs() << "Return pointer in location " << SavedStateArgStart << "\n";
+	    // errs() << "Return pointer in location " << SavedStateArgStart << "\n";
 	    SavedStateTypes.push_back(
 		llvm::PointerType::getUnqual(FnTy->getReturnType()));
 	    ReplaceValues[&CurFn->getArgumentList().back()]
@@ -3343,7 +3330,7 @@ ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
 	for( llvm::FunctionType::param_iterator
 		 I=FnTy->param_begin(),
 		 E=FnTy->param_end(); I != E; ++I ) {
-	    errs() << "FnTy Arg "; (*I)->dump(); errs() << "\n";
+	    // errs() << "FnTy Arg "; (*I)->dump(); errs() << "\n";
 	    SavedStateTypes.push_back( *I );
 	}
     }
@@ -3415,16 +3402,18 @@ ConstructCilkDataflowSavedState(CallExpr::const_arg_iterator ArgBeg,
 	    }
 	}
 
+/*
 	llvm::errs() << "replace value field=" << I->second.field << "\n";
 	I->first->dump();
 	if( I->second.GEP )
 	    I->second.GEP->dump();
+*/
     }
 
     // Emit the function call with the current arguments, referencing
     // the individual alloca's for each of the arguments. We will replace
     // these later.
-    llvm::errs() << " *** Done with ConstructCilkDataflowSavedState ***\n";
+    // llvm::errs() << " *** Done with ConstructCilkDataflowSavedState ***\n";
 
     // Write the body of the ini_ready_fn() now that we know the arguments
     CreateIssueFn(*this, ArgBeg, ArgEnd);
