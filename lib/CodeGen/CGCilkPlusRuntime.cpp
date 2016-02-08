@@ -2680,11 +2680,15 @@ CompleteIniReadyFn(CodeGenFunction &CGF,
       Value *CallFn = CreateCallFn(CGF, CGF.CurFn);
       StoreField(B, CallFn, PF, PendingFrameBuilder::call_fn);
 
-      // spawn_helper_issue_fn( pf, s );
-      B.CreateCall2(Info->getIssueFn(), PF, PFAT);
+      // Note: detach before issue. Issue may move the pending_frame on the
+      // ready list, so we need to complete initialisation of the pending frame
+      // and the associated full frame prior to issue.
 
       // __cilkrts_detach_pending(pf);
       B.CreateCall(CILKRTS_FUNC(detach_pending, CGF), PF);
+
+      // spawn_helper_issue_fn( pf, s );
+      B.CreateCall2(Info->getIssueFn(), PF, PFAT);
 
       B.CreateRet(PF);
   }
