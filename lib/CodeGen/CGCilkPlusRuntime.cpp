@@ -72,7 +72,8 @@ enum {
   CILK_FRAME_DATAFLOW         =  0x0200,
   CILK_FRAME_DATAFLOW_ISSUED  =  0x0400,
   CILK_FRAME_SUSPENDED        =  0x8000,
-  CILK_FRAME_UNWINDING        = 0x10000
+  CILK_FRAME_UNWINDING        = 0x10000,
+  CILK_FRAME_NUMA             = 0x20000
 };
 
 #define CILK_FRAME_VERSION (__CILKRTS_ABI_VERSION << 24)
@@ -320,6 +321,8 @@ public:
       TypeBuilder<void *,                 X>::get(C), // args_tags
       TypeBuilder<__cilkrts_stack_frame *,X>::get(C), // df_issue_child
       TypeBuilder<__cilkrts_stack_frame*volatile*,X>::get(C), // df_issue_me_ptr
+      TypeBuilder<uint32_t,               X>::get(C), // numa_low
+      TypeBuilder<uint32_t,               X>::get(C), // numa_high
       NULL);
     return Ty;
   }
@@ -337,7 +340,9 @@ public:
     df_issue_fn,
     args_tags,
     df_issue_child,
-    df_issue_me_ptr
+    df_issue_me_ptr,
+    numa_low,
+    numa_high
   };
 };
 
