@@ -1981,17 +1981,36 @@ CodeGenFunction::EmitCilkForStmt(const CilkForStmt &S, llvm::Value *Grainsize) {
     // Get or insert the cilk_for abi function.
     llvm::Constant *CilkForABI = 0;
     llvm::FunctionType *FTy = 0;
+
+    // Is this a special iteration for a NUMA-aware cilk_for loop?
+    bool IsNumaIterator = false;
+    {
+	const VarDecl *LCV = S.getLoopControlVar();
+	QualType LCVTy = LCV->getType();
+	if( const TypedefType *TDTy = dyn_cast<TypedefType>( LCVTy.getTypePtr() ) ) {
+	    if( IdentifierInfo *id = TDTy->getDecl()->getIdentifier() )
+		if( id->isStr( "__Cilk_numa_iterator_t" ) )
+		    IsNumaIterator = true;
+	}
+    }
+
     {
       llvm::Module &M = CGM.getModule();
       uint64_t SizeInBits = getContext().getTypeSize(LoopCountExpr->getType());
       if (SizeInBits <= 32u) {
         FTy = llvm::TypeBuilder<void(void(void *, uint32_t, uint32_t),
                                      void *, uint32_t, int), false>::get(Ctx);
-        CilkForABI = M.getOrInsertFunction("__cilkrts_cilk_for_32", FTy);
+	if( IsNumaIterator )
+	    CilkForABI = M.getOrInsertFunction("__cilkrts_cilk_for_numa_32", FTy);
+	else
+	    CilkForABI = M.getOrInsertFunction("__cilkrts_cilk_for_32", FTy);
       } else if (SizeInBits <= 64u) {
         FTy = llvm::TypeBuilder<void(void(void *, uint64_t, uint64_t),
                                      void *, uint64_t, int), false>::get(Ctx);
-        CilkForABI = M.getOrInsertFunction("__cilkrts_cilk_for_64", FTy);
+	if( IsNumaIterator )
+	    CilkForABI = M.getOrInsertFunction("__cilkrts_cilk_for_numa_64", FTy);
+	else
+	    CilkForABI = M.getOrInsertFunction("__cilkrts_cilk_for_64", FTy);
       } else
         llvm_unreachable("unexpected loop count type size");
     }
