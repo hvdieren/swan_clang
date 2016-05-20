@@ -98,7 +98,7 @@ typedef void (*__cilk_abi_f64_t)(void *data, cilk64_t low, cilk64_t high);
 
 typedef void (__cilkrts_enter_frame)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_enter_frame_1)(__cilkrts_stack_frame *sf);
-typedef void (__cilkrts_enter_frame_df)(__cilkrts_stack_frame *sf); // TODO: unused
+// typedef void (__cilkrts_enter_frame_df)(__cilkrts_stack_frame *sf); // TODO: unused
 typedef void (__cilkrts_enter_frame_fast)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_enter_frame_fast_1)(__cilkrts_stack_frame *sf);
 typedef void (__cilkrts_enter_frame_fast_df)(__cilkrts_stack_frame *sf);
@@ -1251,8 +1251,16 @@ static Function *GetCilkResetWorkerFn(CodeGenFunction &CGF) {
 ///     }
 ///     sf->call_parent = w->current_stack_frame;
 ///     sf->worker = w;
+///     sf->df_issue_child = 0;
 ///     /* sf->except_data is only valid when CILK_FRAME_EXCEPTING is set */
 ///     w->current_stack_frame = sf;
+///     if( sf->call_parent ) {
+///	    sf->call_parent->df_issue_child = 0;
+///	    sf->df_issue_me_ptr = &sf->call_parent->df_issue_child;
+///	    sf->flags |= sf->call_parent->flags & CILK_FRAME_NUMA;
+///	    sf->numa_low = sf->call_parent->numa_low;
+///	    sf->numa_high = sf->call_parent->numa_high;
+///     }
 /// }
 static Function *Get__cilkrts_enter_frame_1(CodeGenFunction &CGF) {
   Function *Fn = 0;
@@ -1268,9 +1276,13 @@ static Function *Get__cilkrts_enter_frame_1(CodeGenFunction &CGF) {
   BasicBlock *SlowPath = BasicBlock::Create(Ctx, "", Fn);
   BasicBlock *FastPath = BasicBlock::Create(Ctx, "", Fn);
   BasicBlock *Cont = BasicBlock::Create(Ctx, "", Fn);
+  BasicBlock *CopyState = BasicBlock::Create(Ctx, "", Fn);
+  BasicBlock *Ret = BasicBlock::Create(Ctx, "", Fn);
 
   llvm::PointerType *WorkerPtrTy = TypeBuilder<__cilkrts_worker*, false>::get(Ctx);
+  llvm::PointerType *StackFramePtrTy = TypeBuilder<__cilkrts_stack_frame*, false>::get(Ctx);
   StructType *SFTy = StackFrameBuilder::get(Ctx);
+  llvm::Type *Ty = SFTy->getElementType(StackFrameBuilder::flags);
 
   // Block  (Entry)
   CallInst *W = 0;
@@ -1285,7 +1297,6 @@ static Function *Get__cilkrts_enter_frame_1(CodeGenFunction &CGF) {
   {
     CGBuilderTy B(SlowPath);
     Wslow = B.CreateCall(CILKRTS_FUNC(bind_thread_1, CGF));
-    llvm::Type *Ty = SFTy->getElementType(StackFrameBuilder::flags);
     StoreField(B,
       ConstantInt::get(Ty, CILK_FRAME_LAST | CILK_FRAME_VERSION),
       SF, StackFrameBuilder::flags);
@@ -1301,6 +1312,7 @@ static Function *Get__cilkrts_enter_frame_1(CodeGenFunction &CGF) {
     B.CreateBr(Cont);
   }
   // Block  (Cont)
+  Value *CP;
   {
     CGBuilderTy B(Cont);
     Value *Wfast = W;
@@ -1308,13 +1320,43 @@ static Function *Get__cilkrts_enter_frame_1(CodeGenFunction &CGF) {
     W->addIncoming(Wslow, SlowPath);
     W->addIncoming(Wfast, FastPath);
 
-    StoreField(B,
-      LoadField(B, W, WorkerBuilder::current_stack_frame),
-      SF, StackFrameBuilder::call_parent);
+    CP = LoadField(B, W, WorkerBuilder::current_stack_frame);
+    StoreField(B, CP, SF, StackFrameBuilder::call_parent);
 
     StoreField(B, W, SF, StackFrameBuilder::worker);
     StoreField(B, SF, W, WorkerBuilder::current_stack_frame);
 
+    StoreField(B, ConstantPointerNull::get(StackFramePtrTy), SF,
+	       StackFrameBuilder::df_issue_child);
+
+    Value *Cond = B.CreateICmpEQ(CP, ConstantPointerNull::get(WorkerPtrTy));
+    B.CreateCondBr(Cond, Ret, CopyState);
+  }
+
+  // Block (CopyState)
+  {
+    CGBuilderTy B(CopyState);
+    // Dataflow linkage between frames
+    StoreField(B, ConstantPointerNull::get(StackFramePtrTy), CP,
+	       StackFrameBuilder::df_issue_child);
+    StoreField(B, GEP(B, CP, StackFrameBuilder::df_issue_child), SF,
+	       StackFrameBuilder::df_issue_me_ptr);
+    // Propagate NUMA properties of parent
+    StoreField(B,
+	       B.CreateOr(LoadField(B, SF, StackFrameBuilder::flags),
+			  B.CreateAnd(LoadField(B, CP, StackFrameBuilder::flags),
+				      ConstantInt::get(Ty, CILK_FRAME_NUMA))),
+	       SF, StackFrameBuilder::flags);
+    StoreField(B, LoadField(B, CP, StackFrameBuilder::numa_low),
+	       SF, StackFrameBuilder::numa_low);
+    StoreField(B, LoadField(B, CP, StackFrameBuilder::numa_high),
+	       SF, StackFrameBuilder::numa_high);
+    B.CreateBr(Ret);
+  }
+
+  // Block (Ret)
+  {
+    CGBuilderTy B(Ret);
     B.CreateRetVoid();
   }
 
@@ -1339,11 +1381,16 @@ static Function *Get__cilkrts_enter_frame_1(CodeGenFunction &CGF) {
 ///     sf->worker = w;
 ///     /* sf->except_data is only valid when CILK_FRAME_EXCEPTING is set */
 ///     w->current_stack_frame = sf;
+///     sf->df_issue_child = 0;
 ///     if(sf->call_parent) {
-///        sf->call_parent->df_issue_child = sf;
-///        sf->df_issue_me_ptr = &sf->call_parent->df_issue_child;
+///         sf->call_parent->df_issue_child = sf;
+///	    sf->df_issue_me_ptr = &sf->call_parent->df_issue_child;
+///	    sf->flags |= sf->call_parent->flags & CILK_FRAME_NUMA;
+///	    sf->numa_low = sf->call_parent->numa_low;
+///	    sf->numa_high = sf->call_parent->numa_high;
 ///     }
 /// }
+#if 0 // Unused
 static Function *Get__cilkrts_enter_frame_df(CodeGenFunction &CGF) {
   Function *Fn = 0;
 
@@ -1363,6 +1410,7 @@ static Function *Get__cilkrts_enter_frame_df(CodeGenFunction &CGF) {
 
   llvm::PointerType *WorkerPtrTy = TypeBuilder<__cilkrts_worker*, false>::get(Ctx);
   StructType *SFTy = StackFrameBuilder::get(Ctx);
+  llvm::Type *Ty = SFTy->getElementType(StackFrameBuilder::flags);
 
   // Block  (Entry)
   CallInst *W = 0;
@@ -1377,7 +1425,6 @@ static Function *Get__cilkrts_enter_frame_df(CodeGenFunction &CGF) {
   {
     CGBuilderTy B(SlowPath);
     Wslow = B.CreateCall(CILKRTS_FUNC(bind_thread_1, CGF));
-    llvm::Type *Ty = SFTy->getElementType(StackFrameBuilder::flags);
     StoreField(B,
       ConstantInt::get(Ty, CILK_FRAME_LAST | CILK_FRAME_VERSION
 		       | CILK_FRAME_DATAFLOW),
@@ -1410,15 +1457,29 @@ static Function *Get__cilkrts_enter_frame_df(CodeGenFunction &CGF) {
     StoreField(B, W, SF, StackFrameBuilder::worker);
     StoreField(B, SF, W, WorkerBuilder::current_stack_frame);
 
+    StoreField(B, ConstantPointerNull::get(StackFramePtrTy), SF,
+	       StackFrameBuilder::df_issue_child);
+
     Value *Cond = B.CreateICmpNE(CP, NullSF);
     B.CreateCondBr(Cond,SetIssue,Return);
   }
 
   {
       CGBuilderTy B(SetIssue);
+      // Dataflow linkage between frames
       StoreField(B, SF, CP, StackFrameBuilder::df_issue_child);
       StoreField(B, GEP(B, CP, StackFrameBuilder::df_issue_child), SF,
 		 StackFrameBuilder::df_issue_me_ptr);
+      // Propagate NUMA properties of parent
+      StoreField(B,
+		 B.CreateOr(LoadField(B, SF, StackFrameBuilder::flags),
+			    B.CreateAnd(LoadField(B, CP, StackFrameBuilder::flags),
+					ConstantInt::get(Ty, CILK_FRAME_NUMA))),
+		 SF, StackFrameBuilder::flags);
+      StoreField(B, LoadField(B, CP, StackFrameBuilder::numa_low),
+		 SF, StackFrameBuilder::numa_low);
+      StoreField(B, LoadField(B, CP, StackFrameBuilder::numa_high),
+		 SF, StackFrameBuilder::numa_high);
       B.CreateRetVoid();
   }
 
@@ -1431,6 +1492,7 @@ static Function *Get__cilkrts_enter_frame_df(CodeGenFunction &CGF) {
 
   return Fn;
 }
+#endif
 
 
 /// \brief Get or create a LLVM function for __cilkrts_enter_frame_fast.
@@ -1439,11 +1501,19 @@ static Function *Get__cilkrts_enter_frame_df(CodeGenFunction &CGF) {
 /// void __cilkrts_enter_frame_fast_1(struct __cilkrts_stack_frame *sf)
 /// {
 ///     struct __cilkrts_worker *w = __cilkrts_get_tls_worker();
-///     sf->flags = CILK_FRAME_VERSION;
+///     sf->flags = CILK_FRAME_VERSION
+///               | (sf->call_parent->flags & CILK_FRAME_NUMA);
 ///     sf->call_parent = w->current_stack_frame;
 ///     sf->worker = w;
 ///     /* sf->except_data is only valid when CILK_FRAME_EXCEPTING is set */
 ///     w->current_stack_frame = sf;
+///
+///     sf->df_issue_child = 0;
+///     sf->call_parent->df_issue_child = 0;
+///
+///     // sf->flags |= sf->call_parent->flags & CILK_FRAME_NUMA;
+///     sf->numa_low = sf->call_parent->numa_low;
+///     sf->numa_high = sf->call_parent->numa_high;
 /// }
 static Function *Get__cilkrts_enter_frame_fast_1(CodeGenFunction &CGF) {
   Function *Fn = 0;
@@ -1459,17 +1529,32 @@ static Function *Get__cilkrts_enter_frame_fast_1(CodeGenFunction &CGF) {
 
   CGBuilderTy B(Entry);
   Value *W = B.CreateCall(CILKRTS_FUNC(get_tls_worker, CGF));
+  llvm::PointerType *StackFramePtrTy = TypeBuilder<__cilkrts_stack_frame*, false>::get(Ctx);
   StructType *SFTy = StackFrameBuilder::get(Ctx);
   llvm::Type *Ty = SFTy->getElementType(StackFrameBuilder::flags);
 
+  Value *CP = LoadField(B, W, WorkerBuilder::current_stack_frame);
   StoreField(B,
-    ConstantInt::get(Ty, CILK_FRAME_VERSION),
-    SF, StackFrameBuilder::flags);
-  StoreField(B,
-    LoadField(B, W, WorkerBuilder::current_stack_frame),
-    SF, StackFrameBuilder::call_parent);
+	     B.CreateOr(ConstantInt::get(Ty, CILK_FRAME_VERSION),
+			B.CreateAnd(LoadField(B, CP, StackFrameBuilder::flags),
+				    ConstantInt::get(Ty, CILK_FRAME_NUMA))),
+	     SF, StackFrameBuilder::flags);
+  StoreField(B, CP, SF, StackFrameBuilder::call_parent);
   StoreField(B, W, SF, StackFrameBuilder::worker);
   StoreField(B, SF, W, WorkerBuilder::current_stack_frame);
+
+  StoreField(B, ConstantPointerNull::get(StackFramePtrTy), SF,
+	     StackFrameBuilder::df_issue_child);
+
+  // Dataflow linkage between frames
+  StoreField(B, SF, CP, StackFrameBuilder::df_issue_child);
+  StoreField(B, GEP(B, CP, StackFrameBuilder::df_issue_child), SF,
+	     StackFrameBuilder::df_issue_me_ptr);
+  // Propagate NUMA properties of parent
+  StoreField(B, LoadField(B, CP, StackFrameBuilder::numa_low),
+	     SF, StackFrameBuilder::numa_low);
+  StoreField(B, LoadField(B, CP, StackFrameBuilder::numa_high),
+	     SF, StackFrameBuilder::numa_high);
 
   B.CreateRetVoid();
 
@@ -1489,6 +1574,7 @@ static Function *Get__cilkrts_enter_frame_fast_1(CodeGenFunction &CGF) {
 ///     sf->worker = w;
 ///     /* sf->except_data is only valid when CILK_FRAME_EXCEPTING is set */
 ///     w->current_stack_frame = sf;
+///     sf->df_issue_child = 0;
 ///     sf->call_parent->df_issue_child = sf;
 ///     sf->df_issue_me_ptr = &sf->call_parent->df_issue_child;
 /// }
@@ -1507,20 +1593,34 @@ static Function *Get__cilkrts_enter_frame_fast_df(CodeGenFunction &CGF) {
 
   CGBuilderTy B(Entry);
   Value *W = B.CreateCall(CILKRTS_FUNC(get_tls_worker, CGF));
+  llvm::PointerType *StackFramePtrTy = TypeBuilder<__cilkrts_stack_frame*, false>::get(Ctx);
   StructType *SFTy = StackFrameBuilder::get(Ctx);
   llvm::Type *Ty = SFTy->getElementType(StackFrameBuilder::flags);
 
-  StoreField(B,
-    ConstantInt::get(Ty, CILK_FRAME_VERSION | CILK_FRAME_DATAFLOW),
-    SF, StackFrameBuilder::flags);
   Value *CP = LoadField(B, W, WorkerBuilder::current_stack_frame);
+  StoreField(B,
+	     B.CreateOr(
+		 ConstantInt::get(Ty, CILK_FRAME_VERSION | CILK_FRAME_DATAFLOW),
+		 B.CreateAnd(LoadField(B, CP, StackFrameBuilder::flags),
+			     ConstantInt::get(Ty, CILK_FRAME_NUMA))),
+	     SF, StackFrameBuilder::flags);
   StoreField(B, CP, SF, StackFrameBuilder::call_parent);
   StoreField(B, W, SF, StackFrameBuilder::worker);
   StoreField(B, SF, W, WorkerBuilder::current_stack_frame);
 
+  StoreField(B, ConstantPointerNull::get(StackFramePtrTy), SF,
+	     StackFrameBuilder::df_issue_child);
+
+  // Dataflow linkage between frames
   StoreField(B, SF, CP, StackFrameBuilder::df_issue_child);
   StoreField(B, GEP(B, CP, StackFrameBuilder::df_issue_child), SF,
 	     StackFrameBuilder::df_issue_me_ptr);
+
+  // Propagate NUMA properties of parent
+  StoreField(B, LoadField(B, CP, StackFrameBuilder::numa_low),
+	     SF, StackFrameBuilder::numa_low);
+  StoreField(B, LoadField(B, CP, StackFrameBuilder::numa_high),
+	     SF, StackFrameBuilder::numa_high);
 
   B.CreateRetVoid();
 
@@ -1660,6 +1760,7 @@ static llvm::Function *GetCilkHelperPrologue(CodeGenFunction &CGF) {
 ///   __cilkrts_enter_frame_fast_df(sf);
 ///   sf->df_issue_fn = issue_fn;
 ///   sf->args_tags = (char *)at;
+///   sf->df_issue_child = 0;
 ///   if( !PARENT_SYNCED ) {
 ///	  sf->flags |= CILK_FRAME_DATAFLOW_ISSUED;
 ///	  (*issue_fn)( 0, at ); // pending_frame *, void *
@@ -1680,6 +1781,8 @@ static llvm::Function *GetCilkDataflowHelperPrologue(CodeGenFunction &CGF) {
   // If we get here we need to add the function body
   LLVMContext &Ctx = CGF.getLLVMContext();
 
+  llvm::PointerType *StackFramePtrTy = TypeBuilder<__cilkrts_stack_frame*, false>::get(Ctx);
+
   llvm::Function::arg_iterator Arg = Fn->arg_begin();
   Value *SF = Arg;
   Value *AT = ++Arg;
@@ -1699,6 +1802,9 @@ static llvm::Function *GetCilkDataflowHelperPrologue(CodeGenFunction &CGF) {
   // sf->args_tags = (char *)at;
   StoreField(B, IF, SF, StackFrameBuilder::df_issue_fn);
   StoreField(B, AT, SF, StackFrameBuilder::args_tags);
+
+  StoreField(B, ConstantPointerNull::get(StackFramePtrTy), SF,
+	     StackFrameBuilder::df_issue_child);
 
   // if( !PARENT_SYNCED ) {
   Value *Cond = B.CreateICmpNE(PARENT_SYNCED,
@@ -2946,9 +3052,11 @@ static llvm::Value *LookupStackFrameArg(CodeGenFunction &CGF) {
   return CGF.CurFn->getValueSymbolTable().lookup(stack_frame_arg_name);
 }
 
+#if 0 // unused
 static llvm::Value *LookupStackFramePointer(CodeGenFunction &CGF) {
   return CGF.CurFn->getValueSymbolTable().lookup(stack_frame_pointer_name);
 }
+#endif
 
 static llvm::Value *LookupHelperFlag(CodeGenFunction &CGF) {
   return CGF.CurFn->getValueSymbolTable().lookup(helper_flag_name);
