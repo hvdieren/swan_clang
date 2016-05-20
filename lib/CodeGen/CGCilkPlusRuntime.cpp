@@ -1329,7 +1329,7 @@ static Function *Get__cilkrts_enter_frame_1(CodeGenFunction &CGF) {
     StoreField(B, ConstantPointerNull::get(StackFramePtrTy), SF,
 	       StackFrameBuilder::df_issue_child);
 
-    Value *Cond = B.CreateICmpEQ(CP, ConstantPointerNull::get(WorkerPtrTy));
+    Value *Cond = B.CreateICmpEQ(CP, ConstantPointerNull::get(StackFramePtrTy));
     B.CreateCondBr(Cond, Ret, CopyState);
   }
 
@@ -3052,11 +3052,9 @@ static llvm::Value *LookupStackFrameArg(CodeGenFunction &CGF) {
   return CGF.CurFn->getValueSymbolTable().lookup(stack_frame_arg_name);
 }
 
-#if 0 // unused
 static llvm::Value *LookupStackFramePointer(CodeGenFunction &CGF) {
   return CGF.CurFn->getValueSymbolTable().lookup(stack_frame_pointer_name);
 }
-#endif
 
 static llvm::Value *LookupHelperFlag(CodeGenFunction &CGF) {
   return CGF.CurFn->getValueSymbolTable().lookup(helper_flag_name);
