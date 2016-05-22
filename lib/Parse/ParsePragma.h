@@ -107,9 +107,9 @@ public:
                             Token &FirstToken);
 };
 
-class PragmaCilkGrainsizeHandler : public PragmaHandler {
+class PragmaCilkHandler : public PragmaHandler {
 public:
-  PragmaCilkGrainsizeHandler() : PragmaHandler("cilk") {}
+  PragmaCilkHandler() : PragmaHandler("cilk") {}
   virtual void HandlePragma(Preprocessor &PP, PragmaIntroducerKind Introducer,
                             Token &FirstToken);
 };

@@ -103,8 +103,8 @@ Parser::Parser(Preprocessor &pp, Sema &actions, bool skipFunctionBodies)
   PP.AddPragmaHandler(OpenMPHandler.get());
 
   if (getLangOpts().CilkPlus) {
-    CilkGrainsizeHandler.reset(new PragmaCilkGrainsizeHandler());
-    PP.AddPragmaHandler(CilkGrainsizeHandler.get());
+    CilkHandler.reset(new PragmaCilkHandler());
+    PP.AddPragmaHandler(CilkHandler.get());
   }
 
   if (getLangOpts().MicrosoftExt) {
@@ -476,8 +476,8 @@ Parser::~Parser() {
   OpenMPHandler.reset();
 
   if (getLangOpts().CilkPlus) {
-    PP.RemovePragmaHandler(CilkGrainsizeHandler.get());
-    CilkGrainsizeHandler.reset();
+    PP.RemovePragmaHandler(CilkHandler.get());
+    CilkHandler.reset();
   }
 
   if (getLangOpts().MicrosoftExt) {

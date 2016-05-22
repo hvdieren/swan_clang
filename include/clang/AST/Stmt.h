@@ -2165,6 +2165,44 @@ public:
   }
 };
 
+/// \brief This represents a Cilk for NUMA statement.
+/// \code
+/// #pragma cilk numa [strict]
+/// _Cilk_for(...) { ... }
+/// \endcode
+class CilkForNUMAStmt : public Stmt {
+private:
+  enum { CILK_FOR, LAST };
+  Stmt *SubExprs[LAST];
+  SourceLocation LocStart;
+
+public:
+  /// \brief Construct a Cilk for numa statement.
+  CilkForNUMAStmt(Stmt *CilkFor, SourceLocation LocStart);
+
+  /// \brief Construct an empty Cilk for numa statement.
+  explicit CilkForNUMAStmt(EmptyShell Empty);
+
+  SourceLocation getLocStart() const LLVM_READONLY {
+    return LocStart;
+  }
+  SourceLocation getLocEnd() const LLVM_READONLY {
+    return SubExprs[CILK_FOR]->getLocEnd();
+  }
+
+  Stmt *getCilkFor() { return SubExprs[CILK_FOR]; }
+  const Stmt *getCilkFor() const { return SubExprs[CILK_FOR]; }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == CilkForNUMAStmtClass;
+  }
+
+  child_range children() {
+    return child_range(SubExprs, SubExprs + LAST);
+  }
+};
+
+
 /// \brief This represents a Cilk for statement.
 /// \code
 /// _Cilk_for (int i = 0; i < n; ++i) {

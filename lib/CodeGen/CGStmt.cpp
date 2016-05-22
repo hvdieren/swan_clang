@@ -182,6 +182,9 @@ void CodeGenFunction::EmitStmt(const Stmt *S) {
   case Stmt::CilkForGrainsizeStmtClass:
     EmitCilkForGrainsizeStmt(cast<CilkForGrainsizeStmt>(*S));
     break;
+  case Stmt::CilkForNUMAStmtClass:
+    EmitCilkForNUMAStmt(cast<CilkForNUMAStmt>(*S));
+    break;
   case Stmt::CilkForStmtClass:
     EmitCilkForStmt(cast<CilkForStmt>(*S));
     break;
@@ -1928,15 +1931,32 @@ CodeGenFunction::GenerateCapturedStmtFunction(const CapturedDecl *CD,
 }
 
 void
-CodeGenFunction::EmitCilkForGrainsizeStmt(const CilkForGrainsizeStmt &S) {
+CodeGenFunction::EmitCilkForGrainsizeStmt(const CilkForGrainsizeStmt &S, bool numa) {
   const Expr *E = S.getGrainsize();
   assert(!E->getType()->isReferenceType() && "invalid type");
   llvm::Value *Grainsize = EmitAnyExpr(E).getScalarVal();
-  EmitCilkForStmt(*cast<CilkForStmt>(S.getCilkFor()), Grainsize);
+  if( const CilkForStmt * CF = dyn_cast<CilkForStmt>(S.getCilkFor()) )
+      EmitCilkForStmt(*CF, Grainsize, numa);
+  else
+      EmitCilkForNUMAStmt(*cast<CilkForNUMAStmt>(S.getCilkFor()), Grainsize);
 }
 
 void
-CodeGenFunction::EmitCilkForStmt(const CilkForStmt &S, llvm::Value *Grainsize) {
+CodeGenFunction::EmitCilkForNUMAStmt(const CilkForNUMAStmt &S, llvm::Value *Grainsize) {
+  if( const CilkForStmt * CF = dyn_cast<CilkForStmt>(S.getCilkFor()) )
+      EmitCilkForStmt(*CF, Grainsize, true);
+  else {
+      // FIXME: There is a curious issue allowing arbitrary succession of
+      //        grainsize and numa statements while one of each per cilk_for
+      //        loop is the only thing that makes sense. We chose to ignore all
+      //        but the last of each statement type. We should emit a warning
+      //        here.
+      EmitCilkForGrainsizeStmt(*cast<CilkForGrainsizeStmt>(S.getCilkFor()), true);
+  }
+}
+
+void
+CodeGenFunction::EmitCilkForStmt(const CilkForStmt &S, llvm::Value *Grainsize, bool IsNumaIterator) {
   // if (cond) {
   //   count = loop_count;
   //   grainsize = gs;
@@ -1981,18 +2001,6 @@ CodeGenFunction::EmitCilkForStmt(const CilkForStmt &S, llvm::Value *Grainsize) {
     // Get or insert the cilk_for abi function.
     llvm::Constant *CilkForABI = 0;
     llvm::FunctionType *FTy = 0;
-
-    // Is this a special iteration for a NUMA-aware cilk_for loop?
-    bool IsNumaIterator = false;
-    {
-	const VarDecl *LCV = S.getLoopControlVar();
-	QualType LCVTy = LCV->getType();
-	if( const TypedefType *TDTy = dyn_cast<TypedefType>( LCVTy.getTypePtr() ) ) {
-	    if( IdentifierInfo *id = TDTy->getDecl()->getIdentifier() )
-		if( id->isStr( "__Cilk_numa_iterator_t" ) )
-		    IsNumaIterator = true;
-	}
-    }
 
     {
       llvm::Module &M = CGM.getModule();

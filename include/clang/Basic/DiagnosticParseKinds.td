@@ -851,11 +851,14 @@ def err_cilk_for_missing_increment: Error<
 def err_cilk_for_missing_semi: Error<
   "expected ';' in '_Cilk_for'">;
 
-def err_cilk_for_expect_grainsize: Error<
-  "expected 'grainsize' in '#pragma cilk'">;
+def err_cilk_for_expect_grainsize_or_numa: Error<
+  "expected 'grainsize' or 'numa' in '#pragma cilk'">;
 
 def err_cilk_for_expect_assign: Error<
-  "expected '=' in '#pragma cilk'">;
+  "expected '=' in '#pragma cilk grainsize'">;
+
+def err_cilk_for_expect_numa_attribute: Error<
+  "expected 'strict' in '#pragma cilk numa'">;
 
 def warn_cilk_for_following_grainsize: Warning<
   "'#pragma cilk' ignored, because it is not followed by a '_Cilk_for' loop">,

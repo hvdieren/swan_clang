@@ -782,10 +782,11 @@ PragmaOpenCLExtensionHandler::HandlePragma(Preprocessor &PP,
 /// \brief Handle Cilk Plus grainsize pragma.
 ///
 /// #pragma 'cilk' 'grainsize' '=' expr new-line
+/// #pragma 'cilk' 'numa' '(' 'strict' ')' new-line
 ///
-void PragmaCilkGrainsizeHandler::HandlePragma(Preprocessor &PP,
-                                              PragmaIntroducerKind Introducer,
-                                              Token &FirstToken) {
+void PragmaCilkHandler::HandlePragma(Preprocessor &PP,
+                                     PragmaIntroducerKind Introducer,
+                                     Token &FirstToken) {
   Token Tok;
   PP.Lex(Tok);
   if (Tok.isNot(tok::identifier)) {
@@ -793,52 +794,101 @@ void PragmaCilkGrainsizeHandler::HandlePragma(Preprocessor &PP,
     return;
   }
 
-  IdentifierInfo *Grainsize = Tok.getIdentifierInfo();
-  SourceLocation GrainsizeLoc = Tok.getLocation();
+  IdentifierInfo *Next = Tok.getIdentifierInfo();
+  if (Next->isStr("grainsize")) {
+    SourceLocation GrainsizeLoc = Tok.getLocation();
 
-  if (!Grainsize->isStr("grainsize")) {
-    PP.Diag(Tok, diag::err_cilk_for_expect_grainsize);
-    return;
-  }
-
-  PP.Lex(Tok);
-  if (Tok.isNot(tok::equal)) {
-    PP.Diag(Tok, diag::err_cilk_for_expect_assign);
-    return;
-  }
-
-  // Cache tokens after '=' and store them back to the token stream.
-  SmallVector<Token, 5> CachedToks;
-  while (true) {
     PP.Lex(Tok);
-    if (Tok.is(tok::eod))
-      break;
-    CachedToks.push_back(Tok);
+    if (Tok.isNot(tok::equal)) {
+      PP.Diag(Tok, diag::err_cilk_for_expect_assign);
+      return;
+    }
+
+    // Cache tokens after '=' and store them back to the token stream.
+    SmallVector<Token, 5> CachedToks;
+    while (true) {
+      PP.Lex(Tok);
+      if (Tok.is(tok::eod))
+        break;
+      CachedToks.push_back(Tok);
+    }
+  
+    llvm::BumpPtrAllocator &Allocator = PP.getPreprocessorAllocator();
+    unsigned Size = CachedToks.size();
+  
+    Token *Toks = (Token *) Allocator.Allocate(sizeof(Token) * (Size + 2),
+                                               llvm::alignOf<Token>());
+    Token &GsBeginTok = Toks[0];
+    GsBeginTok.startToken();
+    GsBeginTok.setKind(tok::annot_pragma_cilk_grainsize_begin);
+    GsBeginTok.setLocation(PP.getDirectiveHashLoc());
+
+    SourceLocation EndLoc = Size ? CachedToks.back().getLocation()
+                                 : GrainsizeLoc;
+
+    Token &GsEndTok = Toks[Size + 1];
+    GsEndTok.startToken();
+    GsEndTok.setKind(tok::annot_pragma_cilk_grainsize_end);
+    GsEndTok.setLocation(EndLoc);
+
+    for (unsigned i = 0; i < Size; ++i)
+      Toks[i + 1] = CachedToks[i];
+
+    PP.EnterTokenStream(Toks, Size + 2, /*DisableMacroExpansion=*/true,
+                        /*OwnsTokens=*/false);
+  } else if (Next->isStr("numa")) {
+    SourceLocation NUMALoc = Tok.getLocation();
+
+    PP.Lex(Tok);
+    if (Tok.isNot(tok::l_paren)) {
+      PP.Diag(NUMALoc, diag::err_expected_lparen);
+      return;
+    }
+
+    PP.Lex(Tok);
+    if (Tok.isNot(tok::identifier)) {
+      PP.Diag(Tok, diag::err_cilk_for_expect_numa_attribute);
+      return;
+    }
+    IdentifierInfo *NUMAAttrib = Tok.getIdentifierInfo();
+
+    PP.Lex(Tok);
+    if (Tok.isNot(tok::r_paren)) {
+      PP.Diag(NUMALoc, diag::err_expected_rparen);
+      return;
+    }
+
+    if( !NUMAAttrib->isStr("strict") ) {
+      PP.Diag(Tok, diag::err_cilk_for_expect_numa_attribute);
+      return;
+    }
+
+    PP.Lex(Tok);
+    if( !Tok.is(tok::eod) ) {
+      PP.Diag(Tok, diag::err_cilk_for_expect_numa_attribute);
+      return;
+    }
+
+    llvm::BumpPtrAllocator &Allocator = PP.getPreprocessorAllocator();
+
+    Token *Toks = (Token *) Allocator.Allocate(sizeof(Token) * 2,
+                                               llvm::alignOf<Token>());
+    Token &GsBeginTok = Toks[0];
+    GsBeginTok.startToken();
+    GsBeginTok.setKind(tok::annot_pragma_cilk_numa_begin);
+    GsBeginTok.setLocation(PP.getDirectiveHashLoc());
+
+    Token &GsEndTok = Toks[1];
+    GsEndTok.startToken();
+    GsEndTok.setKind(tok::annot_pragma_cilk_numa_end);
+    GsEndTok.setLocation(NUMALoc);
+
+    PP.EnterTokenStream(Toks, 2, /*DisableMacroExpansion=*/true,
+                        /*OwnsTokens=*/false);
+  } else {
+    PP.Diag(Tok, diag::err_cilk_for_expect_grainsize_or_numa);
+    return;
   }
-
-  llvm::BumpPtrAllocator &Allocator = PP.getPreprocessorAllocator();
-  unsigned Size = CachedToks.size();
-
-  Token *Toks = (Token *) Allocator.Allocate(sizeof(Token) * (Size + 2),
-                                             llvm::alignOf<Token>());
-  Token &GsBeginTok = Toks[0];
-  GsBeginTok.startToken();
-  GsBeginTok.setKind(tok::annot_pragma_cilk_grainsize_begin);
-  GsBeginTok.setLocation(PP.getDirectiveHashLoc());
-
-  SourceLocation EndLoc = Size ? CachedToks.back().getLocation()
-                               : GrainsizeLoc;
-
-  Token &GsEndTok = Toks[Size + 1];
-  GsEndTok.startToken();
-  GsEndTok.setKind(tok::annot_pragma_cilk_grainsize_end);
-  GsEndTok.setLocation(EndLoc);
-
-  for (unsigned i = 0; i < Size; ++i)
-    Toks[i + 1] = CachedToks[i];
-
-  PP.EnterTokenStream(Toks, Size + 2, /*DisableMacroExpansion=*/true,
-                      /*OwnsTokens=*/false);
 }
 
 /// \brief Handle '#pragma omp ...' when OpenMP is disabled.

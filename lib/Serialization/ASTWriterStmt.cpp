@@ -1682,6 +1682,11 @@ void ASTStmtWriter::VisitCilkForGrainsizeStmt(CilkForGrainsizeStmt *S) {
   llvm_unreachable("not implemented yet");
 }
 
+void ASTStmtWriter::VisitCilkForNUMAStmt(CilkForNUMAStmt *S) {
+  Code = serialization::STMT_CILK_FOR_NUMA;
+  llvm_unreachable("not implemented yet");
+}
+
 void ASTStmtWriter::VisitCilkForStmt(CilkForStmt *S) {
   Code = serialization::STMT_CILK_FOR;
   llvm_unreachable("not implemented yet");

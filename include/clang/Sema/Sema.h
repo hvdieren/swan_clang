@@ -3048,6 +3048,9 @@ public:
                                          Stmt *CilkFor,
                                          SourceLocation LocStart);
 
+  StmtResult ActOnCilkForNUMAPragma(Stmt *CilkFor,
+                                    SourceLocation LocStart);
+
   bool CheckIfBodyModifiesLoopControlVar(Stmt *Body);
   StmtResult ActOnCilkForStmt(SourceLocation CilkForLoc,
                               SourceLocation LParenLoc,

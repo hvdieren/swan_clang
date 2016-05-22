@@ -818,6 +818,11 @@ StmtResult Sema::ActOnCilkForGrainsizePragma(Expr *GrainsizeExpr, Stmt *CilkFor,
   return new (Context) CilkForGrainsizeStmt(GrainsizeExpr, CilkFor, LocStart);
 }
 
+StmtResult Sema::ActOnCilkForNUMAPragma(Stmt *CilkFor,
+                                        SourceLocation LocStart) {
+  return new (Context) CilkForNUMAStmt(CilkFor, LocStart);
+}
+
 static void CheckForSignedUnsignedWraparounds(
     const VarDecl *ControlVar, const Expr *ControlVarInit, const Expr *Limit,
     Sema &S, int CondDirection, llvm::APSInt Stride, const Expr *StrideExpr) {

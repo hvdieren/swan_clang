@@ -92,7 +92,7 @@ StmtResult Parser::ParseStatement(SourceLocation *TrailingElseLoc) {
 ///         while-statement
 ///         do-statement
 ///         for-statement
-///         grainsize-pragma[opt] cilk-for-statement
+///         grainsize-pragma[opt] numa-pragma[opt] cilk-for-statement
 ///
 ///       expression-statement:
 ///         expression[opt] ';'
@@ -372,6 +372,8 @@ Retry:
     return ParseCilkForStmt();
   case tok::annot_pragma_cilk_grainsize_begin:
     return ParsePragmaCilkGrainsize();
+  case tok::annot_pragma_cilk_numa_begin:
+    return ParsePragmaCilkNUMA();
 
   case tok::annot_pragma_simd:
     ProhibitAttributes(Attrs);
@@ -421,14 +423,42 @@ StmtResult Parser::ParsePragmaCilkGrainsize() {
   // NOTE: The following statement is not necessarily a _Cilk_for statement.
   // It can also be another pragma that appertains to the _Cilk_for. However,
   // since grainsize is the only pragma supported by _Cilk_for, we require the
-  // following statement to be a _Cilk_for.
-  if (!isa<CilkForStmt>(FollowingStmt.get())) {
+  // following statement to be a _Cilk_for. -- FIXME
+  if (!isa<CilkForStmt>(FollowingStmt.get())
+      && !isa<CilkForNUMAStmt>(FollowingStmt.get())) {
+      FollowingStmt.get()->dump();
     Diag(FollowingStmt.get()->getLocStart(),
          diag::warn_cilk_for_following_grainsize);
     return FollowingStmt;
   }
 
   return Actions.ActOnCilkForGrainsizePragma(E.get(), FollowingStmt.get(), HashLoc);
+}
+
+StmtResult Parser::ParsePragmaCilkNUMA() {
+  assert(getLangOpts().CilkPlus && "Cilk Plus extension not enabled");
+  SourceLocation HashLoc = ConsumeToken(); // Eat 'annot_pragma_cilk_numa_begin'.
+
+  ConsumeToken(); // Eat 'annot_pragma_cilk_numa_end'.
+
+  // Parse the following statement.
+  StmtResult FollowingStmt(ParseStatement());
+  if (FollowingStmt.isInvalid())
+    return StmtError();
+
+  // NOTE: The following statement is not necessarily a _Cilk_for statement.
+  // It can also be another pragma that appertains to the _Cilk_for. However,
+  // since grainsize is the only pragma supported by _Cilk_for, we require the
+  // following statement to be a _Cilk_for. -- FIXME
+  if (!isa<CilkForStmt>(FollowingStmt.get())
+      && !isa<CilkForGrainsizeStmt>(FollowingStmt.get())) {
+      FollowingStmt.get()->dump();
+    Diag(FollowingStmt.get()->getLocStart(),
+         diag::warn_cilk_for_following_grainsize);
+    return FollowingStmt;
+  }
+
+  return Actions.ActOnCilkForNUMAPragma(FollowingStmt.get(), HashLoc);
 }
 
 /// \brief Parse an expression statement.

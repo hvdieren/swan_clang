@@ -794,6 +794,10 @@ void StmtProfiler::VisitCilkForGrainsizeStmt(const CilkForGrainsizeStmt *S) {
   VisitStmt(S);
 }
 
+void StmtProfiler::VisitCilkForNUMAStmt(const CilkForNUMAStmt *S) {
+  VisitStmt(S);
+}
+
 void StmtProfiler::VisitCilkForStmt(const CilkForStmt *S) {
   VisitStmt(S);
 }

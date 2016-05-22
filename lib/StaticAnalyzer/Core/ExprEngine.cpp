@@ -711,6 +711,7 @@ void ExprEngine::Visit(const Stmt *S, ExplodedNode *Pred,
 	case Stmt::OMPParallelDirectiveClass:
     case Stmt::CilkSyncStmtClass:
     case Stmt::CilkForGrainsizeStmtClass:
+    case Stmt::CilkForNUMAStmtClass:
     case Stmt::CilkForStmtClass:
     case Stmt::SIMDForStmtClass:
     case Expr::CilkRankedStmtClass:

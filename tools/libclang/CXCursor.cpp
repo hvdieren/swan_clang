@@ -517,6 +517,7 @@ CXCursor cxcursor::MakeCXCursor(const Stmt *S, const Decl *Parent,
   case Stmt::CilkSyncStmtClass:
   case Stmt::CilkSpawnExprClass:
   case Stmt::CilkForGrainsizeStmtClass:
+  case Stmt::CilkForNUMAStmtClass:
   case Stmt::CilkForStmtClass:
   case Stmt::SIMDForStmtClass:
     K = CXCursor_UnexposedStmt;

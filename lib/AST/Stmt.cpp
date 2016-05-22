@@ -1133,6 +1133,17 @@ CilkForGrainsizeStmt::CilkForGrainsizeStmt(EmptyShell Empty)
   SubExprs[CILK_FOR] = 0;
 }
 
+CilkForNUMAStmt::CilkForNUMAStmt(Stmt *CilkFor,
+			         SourceLocation LocStart)
+    : Stmt(CilkForNUMAStmtClass), LocStart(LocStart) {
+  SubExprs[CILK_FOR] = CilkFor;
+}
+
+CilkForNUMAStmt::CilkForNUMAStmt(EmptyShell Empty)
+    : Stmt(CilkForNUMAStmtClass), LocStart() {
+  SubExprs[CILK_FOR] = 0;
+}
+
 /// \brief Construct an empty Cilk for statement.
 CilkForStmt::CilkForStmt(EmptyShell Empty)
     : Stmt(CilkForStmtClass, Empty), LoopControlVar(0), InnerLoopControlVar(0),

@@ -10259,6 +10259,20 @@ TreeTransform<Derived>::TransformCilkForGrainsizeStmt(CilkForGrainsizeStmt *S) {
 
 template<typename Derived>
 StmtResult
+TreeTransform<Derived>::TransformCilkForNUMAStmt(CilkForNUMAStmt *S) {
+  StmtResult SubS = getDerived().TransformStmt(S->getCilkFor());
+  if (SubS.isInvalid())
+    return StmtError();
+
+  if (!getDerived().AlwaysRebuild() && SubS.get() == S->getCilkFor())
+    return Owned(S);
+
+  return getSema().ActOnCilkForNUMAPragma(SubS.take(), SubS.take()->getLocStart());
+}
+
+
+template<typename Derived>
+StmtResult
 TreeTransform<Derived>::TransformCilkForStmt(CilkForStmt *S) {
   // Transform loop initialization.
   StmtResult Init = getDerived().TransformStmt(S->getInit());
