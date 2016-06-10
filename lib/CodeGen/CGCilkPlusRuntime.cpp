@@ -1546,8 +1546,10 @@ static Function *Get__cilkrts_enter_frame_fast_1(CodeGenFunction &CGF) {
   StoreField(B, ConstantPointerNull::get(StackFramePtrTy), SF,
 	     StackFrameBuilder::df_issue_child);
 
-  // Dataflow linkage between frames
-  StoreField(B, SF, CP, StackFrameBuilder::df_issue_child);
+  // Dataflow linkage between frames -- no dataflow
+  // StoreField(B, SF, CP, StackFrameBuilder::df_issue_child);
+  StoreField(B, ConstantPointerNull::get(StackFramePtrTy), CP,
+	     StackFrameBuilder::df_issue_child);
   StoreField(B, GEP(B, CP, StackFrameBuilder::df_issue_child), SF,
 	     StackFrameBuilder::df_issue_me_ptr);
   // Propagate NUMA properties of parent
