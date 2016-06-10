@@ -1546,8 +1546,9 @@ static Function *Get__cilkrts_enter_frame_fast_1(CodeGenFunction &CGF) {
   StoreField(B, ConstantPointerNull::get(StackFramePtrTy), SF,
 	     StackFrameBuilder::df_issue_child);
 
-  // Dataflow linkage between frames -- no dataflow
-  // StoreField(B, SF, CP, StackFrameBuilder::df_issue_child);
+  // Dataflow linkage between frames. No dataflow; do not set
+  // df_issue_child field in call_parent (CP). Set df_issue_child
+  // conservatively. Could set to null.
   StoreField(B, ConstantPointerNull::get(StackFramePtrTy), CP,
 	     StackFrameBuilder::df_issue_child);
   StoreField(B, GEP(B, CP, StackFrameBuilder::df_issue_child), SF,
