@@ -1354,7 +1354,7 @@ namespace clang {
       // Cilk Plus
       STMT_CILKSYNC,
       STMT_CILK_FOR_GRAINSIZE,
-      STMT_CILK_FOR_NUMA,
+      STMT_CILK_FOR_TUNE,
       STMT_CILK_FOR,
       STMT_SIMD_FOR,
       STMT_CILK_RANKED

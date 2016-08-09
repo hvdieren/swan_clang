@@ -2067,7 +2067,7 @@ void StmtPrinter::VisitCilkForGrainsizeStmt(CilkForGrainsizeStmt *Node) {
   PrintStmt(Node->getCilkFor());
 }
 
-void StmtPrinter::VisitCilkForNUMAStmt(CilkForNUMAStmt *Node) {
+void StmtPrinter::VisitCilkForTuneStmt(CilkForTuneStmt *Node) {
   Indent() << "#pragma cilk numa strict\n";
   PrintStmt(Node->getCilkFor());
 }

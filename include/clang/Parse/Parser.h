@@ -1561,11 +1561,11 @@ private:
   /// _Cilk_for (...)
   StmtResult ParsePragmaCilkGrainsize();
 
-  /// \brief Parse the Cilk NUMA pragma followed by a Cilk for statement.
+  /// \brief Parse the Cilk tuning pragma followed by a Cilk for statement.
   ///
-  /// #pragma cilk numa ...
+  /// #pragma cilk [numa (strict)] ...
   /// _Cilk_for (...)
-  StmtResult ParsePragmaCilkNUMA();
+  StmtResult ParsePragmaCilkTune();
 
   /// \brief Describes the behavior that should be taken for an __if_exists
   /// block.

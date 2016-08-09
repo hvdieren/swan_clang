@@ -182,8 +182,8 @@ void CodeGenFunction::EmitStmt(const Stmt *S) {
   case Stmt::CilkForGrainsizeStmtClass:
     EmitCilkForGrainsizeStmt(cast<CilkForGrainsizeStmt>(*S));
     break;
-  case Stmt::CilkForNUMAStmtClass:
-    EmitCilkForNUMAStmt(cast<CilkForNUMAStmt>(*S));
+  case Stmt::CilkForTuneStmtClass:
+    EmitCilkForTuneStmt(cast<CilkForTuneStmt>(*S));
     break;
   case Stmt::CilkForStmtClass:
     EmitCilkForStmt(cast<CilkForStmt>(*S));
@@ -1931,32 +1931,35 @@ CodeGenFunction::GenerateCapturedStmtFunction(const CapturedDecl *CD,
 }
 
 void
-CodeGenFunction::EmitCilkForGrainsizeStmt(const CilkForGrainsizeStmt &S, bool numa) {
+CodeGenFunction::EmitCilkForGrainsizeStmt(const CilkForGrainsizeStmt &S,
+					  CilkForTuneStmt::Tuning tuning) {
   const Expr *E = S.getGrainsize();
   assert(!E->getType()->isReferenceType() && "invalid type");
   llvm::Value *Grainsize = EmitAnyExpr(E).getScalarVal();
   if( const CilkForStmt * CF = dyn_cast<CilkForStmt>(S.getCilkFor()) )
-      EmitCilkForStmt(*CF, Grainsize, numa);
+      EmitCilkForStmt(*CF, Grainsize, tuning);
   else
-      EmitCilkForNUMAStmt(*cast<CilkForNUMAStmt>(S.getCilkFor()), Grainsize);
+      EmitCilkForTuneStmt(*cast<CilkForTuneStmt>(S.getCilkFor()), Grainsize);
 }
 
 void
-CodeGenFunction::EmitCilkForNUMAStmt(const CilkForNUMAStmt &S, llvm::Value *Grainsize) {
+CodeGenFunction::EmitCilkForTuneStmt(const CilkForTuneStmt &S, llvm::Value *Grainsize) {
   if( const CilkForStmt * CF = dyn_cast<CilkForStmt>(S.getCilkFor()) )
-      EmitCilkForStmt(*CF, Grainsize, true);
+      EmitCilkForStmt(*CF, Grainsize, S.getTuning());
   else {
       // FIXME: There is a curious issue allowing arbitrary succession of
       //        grainsize and numa statements while one of each per cilk_for
       //        loop is the only thing that makes sense. We chose to ignore all
       //        but the last of each statement type. We should emit a warning
       //        here.
-      EmitCilkForGrainsizeStmt(*cast<CilkForGrainsizeStmt>(S.getCilkFor()), true);
+      EmitCilkForGrainsizeStmt(*cast<CilkForGrainsizeStmt>(S.getCilkFor()),
+			       S.getTuning());
   }
 }
 
 void
-CodeGenFunction::EmitCilkForStmt(const CilkForStmt &S, llvm::Value *Grainsize, bool IsNumaIterator) {
+CodeGenFunction::EmitCilkForStmt(const CilkForStmt &S, llvm::Value *Grainsize,
+				 CilkForTuneStmt::Tuning tuning) {
   // if (cond) {
   //   count = loop_count;
   //   grainsize = gs;
@@ -2004,23 +2007,43 @@ CodeGenFunction::EmitCilkForStmt(const CilkForStmt &S, llvm::Value *Grainsize, b
 
     {
       llvm::Module &M = CGM.getModule();
+
+      char stubname[22+8];
+      const char *prefix = "__cilkrts_cilk_for";
+      const size_t stubsize = sizeof(stubname)/sizeof(stubname[0]) - 1;
+      size_t filled = strlen(prefix);
+      strncpy(stubname, prefix, stubsize);
+      switch( tuning ) {
+      case CilkForTuneStmt::TUNE_NUMA_STRICT:
+	  strncpy(&stubname[filled], "_numa", stubsize-filled);
+	  filled += 5;
+	  break;
+      case CilkForTuneStmt::TUNE_STATIC:
+	  strncpy(&stubname[filled], "_static", stubsize-filled);
+	  filled += 7;
+	  break;
+      case CilkForTuneStmt::TUNE_NONE:
+	  break;
+      default:
+	  llvm_unreachable("unexpected cilk-for loop tuning option");
+      }
+
       uint64_t SizeInBits = getContext().getTypeSize(LoopCountExpr->getType());
       if (SizeInBits <= 32u) {
         FTy = llvm::TypeBuilder<void(void(void *, uint32_t, uint32_t),
                                      void *, uint32_t, int), false>::get(Ctx);
-	if( IsNumaIterator )
-	    CilkForABI = M.getOrInsertFunction("__cilkrts_cilk_for_numa_32", FTy);
-	else
-	    CilkForABI = M.getOrInsertFunction("__cilkrts_cilk_for_32", FTy);
+	strncpy(&stubname[filled], "_32", stubsize-filled);
+	filled += 3;
       } else if (SizeInBits <= 64u) {
         FTy = llvm::TypeBuilder<void(void(void *, uint64_t, uint64_t),
                                      void *, uint64_t, int), false>::get(Ctx);
-	if( IsNumaIterator )
-	    CilkForABI = M.getOrInsertFunction("__cilkrts_cilk_for_numa_64", FTy);
-	else
-	    CilkForABI = M.getOrInsertFunction("__cilkrts_cilk_for_64", FTy);
+	strncpy(&stubname[filled], "_64", stubsize-filled);
+	filled += 3;
       } else
         llvm_unreachable("unexpected loop count type size");
+
+      stubname[filled] = '\0';
+      CilkForABI = M.getOrInsertFunction(StringRef(stubname, filled), FTy);
     }
 
     // Call __cilkrts_cilk_for_*(helper, captures, count, grainsize);

@@ -2303,7 +2303,7 @@ DEF_TRAVERSE_STMT(CUDAKernelCallExpr, { })
 
 DEF_TRAVERSE_STMT(CilkSyncStmt, { })
 DEF_TRAVERSE_STMT(CilkForGrainsizeStmt, { })
-DEF_TRAVERSE_STMT(CilkForNUMAStmt, { })
+DEF_TRAVERSE_STMT(CilkForTuneStmt, { })
 DEF_TRAVERSE_STMT(CilkForStmt, { })
 DEF_TRAVERSE_STMT(SIMDForStmt, { })
 DEF_TRAVERSE_STMT(CilkRankedStmt, { })

@@ -837,11 +837,11 @@ void PragmaCilkHandler::HandlePragma(Preprocessor &PP,
     PP.EnterTokenStream(Toks, Size + 2, /*DisableMacroExpansion=*/true,
                         /*OwnsTokens=*/false);
   } else if (Next->isStr("numa")) {
-    SourceLocation NUMALoc = Tok.getLocation();
+    SourceLocation TuneLoc = Tok.getLocation();
 
     PP.Lex(Tok);
     if (Tok.isNot(tok::l_paren)) {
-      PP.Diag(NUMALoc, diag::err_expected_lparen);
+      PP.Diag(TuneLoc, diag::err_expected_lparen);
       return;
     }
 
@@ -850,15 +850,15 @@ void PragmaCilkHandler::HandlePragma(Preprocessor &PP,
       PP.Diag(Tok, diag::err_cilk_for_expect_numa_attribute);
       return;
     }
-    IdentifierInfo *NUMAAttrib = Tok.getIdentifierInfo();
+    IdentifierInfo *TuneAttrib = Tok.getIdentifierInfo();
 
     PP.Lex(Tok);
     if (Tok.isNot(tok::r_paren)) {
-      PP.Diag(NUMALoc, diag::err_expected_rparen);
+      PP.Diag(TuneLoc, diag::err_expected_rparen);
       return;
     }
 
-    if( !NUMAAttrib->isStr("strict") ) {
+    if( !TuneAttrib->isStr("strict") ) {
       PP.Diag(Tok, diag::err_cilk_for_expect_numa_attribute);
       return;
     }
@@ -881,7 +881,7 @@ void PragmaCilkHandler::HandlePragma(Preprocessor &PP,
     Token &GsEndTok = Toks[1];
     GsEndTok.startToken();
     GsEndTok.setKind(tok::annot_pragma_cilk_numa_end);
-    GsEndTok.setLocation(NUMALoc);
+    GsEndTok.setLocation(TuneLoc);
 
     PP.EnterTokenStream(Toks, 2, /*DisableMacroExpansion=*/true,
                         /*OwnsTokens=*/false);

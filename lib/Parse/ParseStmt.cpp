@@ -373,7 +373,7 @@ Retry:
   case tok::annot_pragma_cilk_grainsize_begin:
     return ParsePragmaCilkGrainsize();
   case tok::annot_pragma_cilk_numa_begin:
-    return ParsePragmaCilkNUMA();
+    return ParsePragmaCilkTune();
 
   case tok::annot_pragma_simd:
     ProhibitAttributes(Attrs);
@@ -425,7 +425,7 @@ StmtResult Parser::ParsePragmaCilkGrainsize() {
   // since grainsize is the only pragma supported by _Cilk_for, we require the
   // following statement to be a _Cilk_for. -- FIXME
   if (!isa<CilkForStmt>(FollowingStmt.get())
-      && !isa<CilkForNUMAStmt>(FollowingStmt.get())) {
+      && !isa<CilkForTuneStmt>(FollowingStmt.get())) {
       FollowingStmt.get()->dump();
     Diag(FollowingStmt.get()->getLocStart(),
          diag::warn_cilk_for_following_grainsize);
@@ -435,7 +435,7 @@ StmtResult Parser::ParsePragmaCilkGrainsize() {
   return Actions.ActOnCilkForGrainsizePragma(E.get(), FollowingStmt.get(), HashLoc);
 }
 
-StmtResult Parser::ParsePragmaCilkNUMA() {
+StmtResult Parser::ParsePragmaCilkTune() {
   assert(getLangOpts().CilkPlus && "Cilk Plus extension not enabled");
   SourceLocation HashLoc = ConsumeToken(); // Eat 'annot_pragma_cilk_numa_begin'.
 
@@ -458,7 +458,8 @@ StmtResult Parser::ParsePragmaCilkNUMA() {
     return FollowingStmt;
   }
 
-  return Actions.ActOnCilkForNUMAPragma(FollowingStmt.get(), HashLoc);
+  return Actions.ActOnCilkForTunePragma(FollowingStmt.get(), HashLoc,
+					CilkForTuneStmt::TUNE_NUMA_STRICT); // FIXME
 }
 
 /// \brief Parse an expression statement.

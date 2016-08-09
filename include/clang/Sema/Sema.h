@@ -3048,8 +3048,9 @@ public:
                                          Stmt *CilkFor,
                                          SourceLocation LocStart);
 
-  StmtResult ActOnCilkForNUMAPragma(Stmt *CilkFor,
-                                    SourceLocation LocStart);
+  StmtResult ActOnCilkForTunePragma(Stmt *CilkFor,
+                                    SourceLocation LocStart,
+				    CilkForTuneStmt::Tuning t);
 
   bool CheckIfBodyModifiesLoopControlVar(Stmt *Body);
   StmtResult ActOnCilkForStmt(SourceLocation CilkForLoc,

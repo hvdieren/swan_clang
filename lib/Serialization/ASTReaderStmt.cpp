@@ -1828,7 +1828,7 @@ void ASTStmtReader::VisitCilkForGrainsizeStmt(CilkForGrainsizeStmt *S) {
   llvm_unreachable("not implemented yet");
 }
 
-void ASTStmtReader::VisitCilkForNUMAStmt(CilkForNUMAStmt *S) {
+void ASTStmtReader::VisitCilkForTuneStmt(CilkForTuneStmt *S) {
   llvm_unreachable("not implemented yet");
 }
 
@@ -2591,7 +2591,7 @@ Stmt *ASTReader::ReadStmtFromStream(ModuleFile &F) {
       llvm_unreachable("not implemented yet");
       break;
 
-    case STMT_CILK_FOR_NUMA:
+    case STMT_CILK_FOR_TUNE:
       llvm_unreachable("not implemented yet");
       break;
 

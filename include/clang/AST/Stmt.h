@@ -2165,23 +2165,26 @@ public:
   }
 };
 
-/// \brief This represents a Cilk for NUMA statement.
+/// \brief This represents a Cilk for pragma tuning statement.
 /// \code
-/// #pragma cilk numa [strict]
+/// #pragma cilk [numa (strict)]
 /// _Cilk_for(...) { ... }
 /// \endcode
-class CilkForNUMAStmt : public Stmt {
+class CilkForTuneStmt : public Stmt {
+public:
+  enum Tuning { TUNE_NONE, TUNE_NUMA_STRICT, TUNE_STATIC };
 private:
   enum { CILK_FOR, LAST };
   Stmt *SubExprs[LAST];
   SourceLocation LocStart;
+  Tuning tuning;
 
 public:
   /// \brief Construct a Cilk for numa statement.
-  CilkForNUMAStmt(Stmt *CilkFor, SourceLocation LocStart);
+  CilkForTuneStmt(Stmt *CilkFor, SourceLocation LocStart, Tuning t);
 
   /// \brief Construct an empty Cilk for numa statement.
-  explicit CilkForNUMAStmt(EmptyShell Empty);
+  explicit CilkForTuneStmt(EmptyShell Empty);
 
   SourceLocation getLocStart() const LLVM_READONLY {
     return LocStart;
@@ -2190,11 +2193,13 @@ public:
     return SubExprs[CILK_FOR]->getLocEnd();
   }
 
+  Tuning getTuning() const LLVM_READONLY { return tuning; }
+
   Stmt *getCilkFor() { return SubExprs[CILK_FOR]; }
   const Stmt *getCilkFor() const { return SubExprs[CILK_FOR]; }
 
   static bool classof(const Stmt *T) {
-    return T->getStmtClass() == CilkForNUMAStmtClass;
+    return T->getStmtClass() == CilkForTuneStmtClass;
   }
 
   child_range children() {

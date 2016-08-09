@@ -818,9 +818,10 @@ StmtResult Sema::ActOnCilkForGrainsizePragma(Expr *GrainsizeExpr, Stmt *CilkFor,
   return new (Context) CilkForGrainsizeStmt(GrainsizeExpr, CilkFor, LocStart);
 }
 
-StmtResult Sema::ActOnCilkForNUMAPragma(Stmt *CilkFor,
-                                        SourceLocation LocStart) {
-  return new (Context) CilkForNUMAStmt(CilkFor, LocStart);
+StmtResult Sema::ActOnCilkForTunePragma(Stmt *CilkFor,
+                                        SourceLocation LocStart,
+					CilkForTuneStmt::Tuning t) {
+  return new (Context) CilkForTuneStmt(CilkFor, LocStart, t);
 }
 
 static void CheckForSignedUnsignedWraparounds(

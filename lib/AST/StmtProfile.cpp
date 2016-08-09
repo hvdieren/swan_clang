@@ -794,7 +794,7 @@ void StmtProfiler::VisitCilkForGrainsizeStmt(const CilkForGrainsizeStmt *S) {
   VisitStmt(S);
 }
 
-void StmtProfiler::VisitCilkForNUMAStmt(const CilkForNUMAStmt *S) {
+void StmtProfiler::VisitCilkForTuneStmt(const CilkForTuneStmt *S) {
   VisitStmt(S);
 }
 

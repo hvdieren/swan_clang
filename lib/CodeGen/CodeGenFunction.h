@@ -2276,9 +2276,9 @@ public:
                                                SourceLocation Loc);
 
   llvm::Function *EmitSpawnCapturedStmt(const CapturedStmt &S, VarDecl *VD);
-  void EmitCilkForGrainsizeStmt(const CilkForGrainsizeStmt &S, bool IsNumaIterator=false);
-    void EmitCilkForNUMAStmt(const CilkForNUMAStmt &S, llvm::Value *Grainsize = 0);
-  void EmitCilkForStmt(const CilkForStmt &S, llvm::Value *Grainsize = 0, bool IsNumaIterator=false);
+    void EmitCilkForGrainsizeStmt(const CilkForGrainsizeStmt &S, CilkForTuneStmt::Tuning = CilkForTuneStmt::TUNE_NONE);
+    void EmitCilkForTuneStmt(const CilkForTuneStmt &S, llvm::Value *Grainsize = 0);
+  void EmitCilkForStmt(const CilkForStmt &S, llvm::Value *Grainsize = 0, CilkForTuneStmt::Tuning = CilkForTuneStmt::TUNE_NONE);
   void EmitCilkForHelperBody(const Stmt *S);
   void EmitPragmaSimd(CGPragmaSimdWrapper &W);
   llvm::Function *EmitSimdFunction(CGPragmaSimdWrapper &W);

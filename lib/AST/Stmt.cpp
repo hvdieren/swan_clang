@@ -1133,14 +1133,15 @@ CilkForGrainsizeStmt::CilkForGrainsizeStmt(EmptyShell Empty)
   SubExprs[CILK_FOR] = 0;
 }
 
-CilkForNUMAStmt::CilkForNUMAStmt(Stmt *CilkFor,
-			         SourceLocation LocStart)
-    : Stmt(CilkForNUMAStmtClass), LocStart(LocStart) {
+CilkForTuneStmt::CilkForTuneStmt(Stmt *CilkFor,
+			         SourceLocation LocStart,
+				 CilkForTuneStmt::Tuning t)
+    : Stmt(CilkForTuneStmtClass), LocStart(LocStart), tuning(t) {
   SubExprs[CILK_FOR] = CilkFor;
 }
 
-CilkForNUMAStmt::CilkForNUMAStmt(EmptyShell Empty)
-    : Stmt(CilkForNUMAStmtClass), LocStart() {
+CilkForTuneStmt::CilkForTuneStmt(EmptyShell Empty)
+    : Stmt(CilkForTuneStmtClass), LocStart(), tuning(TUNE_NONE) {
   SubExprs[CILK_FOR] = 0;
 }
 
