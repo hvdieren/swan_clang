@@ -2172,7 +2172,7 @@ public:
 /// \endcode
 class CilkForTuneStmt : public Stmt {
 public:
-  enum Tuning { TUNE_NONE, TUNE_NUMA_STRICT, TUNE_STATIC };
+  enum Tuning { TUNE_NONE, TUNE_NUMA_STRICT, TUNE_FINEGRAIN };
 private:
   enum { CILK_FOR, LAST };
   Stmt *SubExprs[LAST];

@@ -372,7 +372,8 @@ Retry:
     return ParseCilkForStmt();
   case tok::annot_pragma_cilk_grainsize_begin:
     return ParsePragmaCilkGrainsize();
-  case tok::annot_pragma_cilk_numa_begin:
+  case tok::annot_pragma_cilk_numa_strict:
+  case tok::annot_pragma_cilk_finegrain:
     return ParsePragmaCilkTune();
 
   case tok::annot_pragma_simd:
@@ -437,9 +438,8 @@ StmtResult Parser::ParsePragmaCilkGrainsize() {
 
 StmtResult Parser::ParsePragmaCilkTune() {
   assert(getLangOpts().CilkPlus && "Cilk Plus extension not enabled");
-  SourceLocation HashLoc = ConsumeToken(); // Eat 'annot_pragma_cilk_numa_begin'.
-
-  ConsumeToken(); // Eat 'annot_pragma_cilk_numa_end'.
+  tok::TokenKind Kind  = Tok.getKind();
+  SourceLocation HashLoc = ConsumeToken(); // Eat 'annot_pragma_cilk_numa'.
 
   // Parse the following statement.
   StmtResult FollowingStmt(ParseStatement());
@@ -458,8 +458,20 @@ StmtResult Parser::ParsePragmaCilkTune() {
     return FollowingStmt;
   }
 
-  return Actions.ActOnCilkForTunePragma(FollowingStmt.get(), HashLoc,
-					CilkForTuneStmt::TUNE_NUMA_STRICT); // FIXME
+  
+  CilkForTuneStmt::Tuning tuning;
+  switch (Kind) {
+  case tok::annot_pragma_cilk_numa_strict:
+      tuning = CilkForTuneStmt::TUNE_NUMA_STRICT;
+      break;
+  case tok::annot_pragma_cilk_finegrain:
+      tuning = CilkForTuneStmt::TUNE_FINEGRAIN;
+      break;
+  default:
+      tuning = CilkForTuneStmt::TUNE_NONE;
+  }
+
+  return Actions.ActOnCilkForTunePragma(FollowingStmt.get(), HashLoc, tuning);
 }
 
 /// \brief Parse an expression statement.

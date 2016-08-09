@@ -678,15 +678,25 @@ ANNOTATION(pragma_cilk_grainsize_begin)
 // handles them.
 ANNOTATION(pragma_cilk_grainsize_end)
 
-// Annotation for #pragma cilk numa...
+// Annotation for #pragma cilk ...
 // The lexer produces these so that they only take effect when the parser
 // handles them.
-ANNOTATION(pragma_cilk_numa_begin)
+ANNOTATION(pragma_cilk_tune_begin)
 
-// Annotation for #pragma cilk numa...
+// Annotation for #pragma cilk ...
 // The lexer produces these so that they only take effect when the parser
 // handles them.
-ANNOTATION(pragma_cilk_numa_end)
+ANNOTATION(pragma_cilk_tune_end)
+
+// Annotation for #pragma cilk numa(strict)...
+// The lexer produces these so that they only take effect when the parser
+// handles them.
+ANNOTATION(pragma_cilk_numa_strict)
+
+// Annotation for #pragma cilk finegrain...
+// The lexer produces these so that they only take effect when the parser
+// handles them.
+ANNOTATION(pragma_cilk_finegrain)
 
 // Annotations for OpenMP pragma directives - #pragma omp ...
 // The lexer produces these so that they only take effect when the parser

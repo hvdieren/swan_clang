@@ -2018,7 +2018,7 @@ CodeGenFunction::EmitCilkForStmt(const CilkForStmt &S, llvm::Value *Grainsize,
 	  strncpy(&stubname[filled], "_numa", stubsize-filled);
 	  filled += 5;
 	  break;
-      case CilkForTuneStmt::TUNE_STATIC:
+      case CilkForTuneStmt::TUNE_FINEGRAIN:
 	  strncpy(&stubname[filled], "_static", stubsize-filled);
 	  filled += 7;
 	  break;

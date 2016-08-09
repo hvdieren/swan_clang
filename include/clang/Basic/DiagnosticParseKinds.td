@@ -852,7 +852,7 @@ def err_cilk_for_missing_semi: Error<
   "expected ';' in '_Cilk_for'">;
 
 def err_cilk_for_expect_grainsize_or_numa: Error<
-  "expected 'grainsize' or 'numa' in '#pragma cilk'">;
+  "expected 'grainsize', 'numa' or 'finegrain' in '#pragma cilk'">;
 
 def err_cilk_for_expect_assign: Error<
   "expected '=' in '#pragma cilk grainsize'">;

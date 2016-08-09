@@ -871,19 +871,34 @@ void PragmaCilkHandler::HandlePragma(Preprocessor &PP,
 
     llvm::BumpPtrAllocator &Allocator = PP.getPreprocessorAllocator();
 
-    Token *Toks = (Token *) Allocator.Allocate(sizeof(Token) * 2,
+    Token *Toks = (Token *) Allocator.Allocate(sizeof(Token),
                                                llvm::alignOf<Token>());
     Token &GsBeginTok = Toks[0];
     GsBeginTok.startToken();
-    GsBeginTok.setKind(tok::annot_pragma_cilk_numa_begin);
+    GsBeginTok.setKind(tok::annot_pragma_cilk_numa_strict);
     GsBeginTok.setLocation(PP.getDirectiveHashLoc());
 
-    Token &GsEndTok = Toks[1];
-    GsEndTok.startToken();
-    GsEndTok.setKind(tok::annot_pragma_cilk_numa_end);
-    GsEndTok.setLocation(TuneLoc);
+    PP.EnterTokenStream(Toks, 1, /*DisableMacroExpansion=*/true,
+                        /*OwnsTokens=*/false);
+  } else if (Next->isStr("finegrain")) {
+    SourceLocation TuneLoc = Tok.getLocation();
 
-    PP.EnterTokenStream(Toks, 2, /*DisableMacroExpansion=*/true,
+    PP.Lex(Tok);
+    if( !Tok.is(tok::eod) ) {
+      PP.Diag(Tok, diag::err_cilk_for_expect_numa_attribute);
+      return;
+    }
+
+    llvm::BumpPtrAllocator &Allocator = PP.getPreprocessorAllocator();
+
+    Token *Toks = (Token *) Allocator.Allocate(sizeof(Token) * 1,
+                                               llvm::alignOf<Token>());
+    Token &GsBeginTok = Toks[0];
+    GsBeginTok.startToken();
+    GsBeginTok.setKind(tok::annot_pragma_cilk_finegrain);
+    GsBeginTok.setLocation(TuneLoc);
+
+    PP.EnterTokenStream(Toks, 1, /*DisableMacroExpansion=*/true,
                         /*OwnsTokens=*/false);
   } else {
     PP.Diag(Tok, diag::err_cilk_for_expect_grainsize_or_numa);
